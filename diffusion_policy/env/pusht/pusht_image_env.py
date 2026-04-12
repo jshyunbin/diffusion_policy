@@ -1,22 +1,24 @@
-from gym import spaces
+from gymnasium import spaces
 from diffusion_policy.env.pusht.pusht_env import PushTEnv
 import numpy as np
 import cv2
 
 class PushTImageEnv(PushTEnv):
-    metadata = {"render.modes": ["rgb_array"], "video.frames_per_second": 10}
+    metadata = {"render_modes": ["rgb_array"], "render_fps": 10, "video.frames_per_second": 10}
 
     def __init__(self,
             legacy=False,
-            block_cog=None, 
+            block_cog=None,
             damping=None,
-            render_size=96):
+            render_size=96,
+            fix_goal=True):
         super().__init__(
-            legacy=legacy, 
+            legacy=legacy,
             block_cog=block_cog,
             damping=damping,
             render_size=render_size,
-            render_action=False)
+            render_action=False,
+            fix_goal=fix_goal)
         ws = self.window_size
         self.observation_space = spaces.Dict({
             'image': spaces.Box(
@@ -33,7 +35,7 @@ class PushTImageEnv(PushTEnv):
             )
         })
         self.render_cache = None
-    
+
     def _get_obs(self):
         img = super()._render_frame(mode='rgb_array')
 
@@ -57,10 +59,8 @@ class PushTImageEnv(PushTEnv):
 
         return obs
 
-    def render(self, mode):
-        assert mode == 'rgb_array'
-
+    def render(self, **kwargs):
         if self.render_cache is None:
             self._get_obs()
-        
+
         return self.render_cache

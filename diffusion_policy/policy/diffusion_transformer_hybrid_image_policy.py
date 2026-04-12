@@ -15,6 +15,7 @@ from robomimic.algo import algo_factory
 from robomimic.algo.algo import PolicyAlgo
 import robomimic.utils.obs_utils as ObsUtils
 import robomimic.models.base_nets as rmbn
+import robomimic.models.obs_core as rmoc
 import diffusion_policy.model.vision.crop_randomizer as dmvc
 from diffusion_policy.common.pytorch_util import dict_apply, replace_submodules
 
@@ -123,7 +124,7 @@ class DiffusionTransformerHybridImagePolicy(BaseImagePolicy):
         if eval_fixed_crop:
             replace_submodules(
                 root_module=obs_encoder,
-                predicate=lambda x: isinstance(x, rmbn.CropRandomizer),
+                predicate=lambda x: isinstance(x, rmoc.CropRandomizer),
                 func=lambda x: dmvc.CropRandomizer(
                     input_shape=x.input_shape,
                     crop_height=x.crop_height,

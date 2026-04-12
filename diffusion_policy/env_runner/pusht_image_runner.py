@@ -9,7 +9,6 @@ import math
 import wandb.sdk.data_types.video as wv
 from diffusion_policy.env.pusht.pusht_image_env import PushTImageEnv
 from diffusion_policy.gym_util.async_vector_env import AsyncVectorEnv
-# from diffusion_policy.gym_util.sync_vector_env import SyncVectorEnv
 from diffusion_policy.gym_util.multistep_wrapper import MultiStepWrapper
 from diffusion_policy.gym_util.video_recording_wrapper import VideoRecordingWrapper, VideoRecorder
 
@@ -35,7 +34,8 @@ class PushTImageRunner(BaseImageRunner):
             render_size=96,
             past_action=False,
             tqdm_interval_sec=5.0,
-            n_envs=None
+            n_envs=None,
+            fix_goal=True
         ):
         super().__init__(output_dir)
         if n_envs is None:
@@ -47,7 +47,8 @@ class PushTImageRunner(BaseImageRunner):
                 VideoRecordingWrapper(
                     PushTImageEnv(
                         legacy=legacy_test,
-                        render_size=render_size
+                        render_size=render_size,
+                        fix_goal=fix_goal
                     ),
                     video_recoder=VideoRecorder.create_h264(
                         fps=fps,
@@ -90,7 +91,7 @@ class PushTImageRunner(BaseImageRunner):
                 # set seed
                 assert isinstance(env, MultiStepWrapper)
                 env.seed(seed)
-            
+
             env_seeds.append(seed)
             env_prefixs.append('train/')
             env_init_fn_dills.append(dill.dumps(init_fn))
@@ -116,18 +117,12 @@ class PushTImageRunner(BaseImageRunner):
                 # set seed
                 assert isinstance(env, MultiStepWrapper)
                 env.seed(seed)
-            
+
             env_seeds.append(seed)
             env_prefixs.append('test/')
             env_init_fn_dills.append(dill.dumps(init_fn))
 
-        env = AsyncVectorEnv(env_fns)
-
-        # test env
-        # env.reset(seed=env_seeds)
-        # x = env.step(env.action_space.sample())
-        # imgs = env.call('render')
-        # import pdb; pdb.set_trace()
+        env = AsyncVectorEnv(env_fns, shared_memory=False)
 
         self.env = env
         self.env_fns = env_fns
@@ -141,7 +136,7 @@ class PushTImageRunner(BaseImageRunner):
         self.past_action = past_action
         self.max_steps = max_steps
         self.tqdm_interval_sec = tqdm_interval_sec
-    
+
     def run(self, policy: BaseImagePolicy):
         device = policy.device
         dtype = policy.dtype
@@ -162,7 +157,7 @@ class PushTImageRunner(BaseImageRunner):
             this_global_slice = slice(start, end)
             this_n_active_envs = end - start
             this_local_slice = slice(0,this_n_active_envs)
-            
+
             this_init_fns = self.env_init_fn_dills[this_global_slice]
             n_diff = n_envs - len(this_init_fns)
             if n_diff > 0:
@@ -170,15 +165,15 @@ class PushTImageRunner(BaseImageRunner):
             assert len(this_init_fns) == n_envs
 
             # init envs
-            env.call_each('run_dill_function', 
+            env.call_each('run_dill_function',
                 args_list=[(x,) for x in this_init_fns])
 
             # start rollout
-            obs = env.reset()
+            obs, _ = env.reset()
             past_action = None
             policy.reset()
 
-            pbar = tqdm.tqdm(total=self.max_steps, desc=f"Eval PushtImageRunner {chunk_idx+1}/{n_chunks}", 
+            pbar = tqdm.tqdm(total=self.max_steps, desc=f"Eval PushtImageRunner {chunk_idx+1}/{n_chunks}",
                 leave=False, mininterval=self.tqdm_interval_sec)
             done = False
             while not done:
@@ -188,9 +183,9 @@ class PushTImageRunner(BaseImageRunner):
                     # TODO: not tested
                     np_obs_dict['past_action'] = past_action[
                         :,-(self.n_obs_steps-1):].astype(np.float32)
-                
+
                 # device transfer
-                obs_dict = dict_apply(np_obs_dict, 
+                obs_dict = dict_apply(np_obs_dict,
                     lambda x: torch.from_numpy(x).to(
                         device=device))
 
@@ -205,8 +200,8 @@ class PushTImageRunner(BaseImageRunner):
                 action = np_action_dict['action']
 
                 # step env
-                obs, reward, done, info = env.step(action)
-                done = np.all(done)
+                obs, reward, terminated, truncated, info = env.step(action)
+                done = np.all(terminated) or np.all(truncated)
                 past_action = action
 
                 # update pbar
@@ -221,14 +216,6 @@ class PushTImageRunner(BaseImageRunner):
         # log
         max_rewards = collections.defaultdict(list)
         log_data = dict()
-        # results reported in the paper are generated using the commented out line below
-        # which will only report and average metrics from first n_envs initial condition and seeds
-        # fortunately this won't invalidate our conclusion since
-        # 1. This bug only affects the variance of metrics, not their mean
-        # 2. All baseline methods are evaluated using the same code
-        # to completely reproduce reported numbers, uncomment this line:
-        # for i in range(len(self.env_fns)):
-        # and comment out this line
         for i in range(n_inits):
             seed = self.env_seeds[i]
             prefix = self.env_prefixs[i]

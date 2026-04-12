@@ -1,5 +1,5 @@
-import gym
-from gym import spaces
+import gymnasium as gym
+from gymnasium import spaces
 import numpy as np
 from collections import defaultdict, deque
 import dill
@@ -54,7 +54,7 @@ def aggregate(data, method='max'):
 def stack_last_n_obs(all_obs, n_steps):
     assert(len(all_obs) > 0)
     all_obs = list(all_obs)
-    result = np.zeros((n_steps,) + all_obs[-1].shape, 
+    result = np.zeros((n_steps,) + all_obs[-1].shape,
         dtype=all_obs[-1].dtype)
     start_idx = -min(n_steps, len(all_obs))
     result[start_idx:] = np.array(all_obs[start_idx:])
@@ -65,10 +65,10 @@ def stack_last_n_obs(all_obs, n_steps):
 
 
 class MultiStepWrapper(gym.Wrapper):
-    def __init__(self, 
-            env, 
-            n_obs_steps, 
-            n_action_steps, 
+    def __init__(self,
+            env,
+            n_obs_steps,
+            n_action_steps,
             max_episode_steps=None,
             reward_agg_method='max'
         ):
@@ -83,45 +83,51 @@ class MultiStepWrapper(gym.Wrapper):
 
         self.obs = deque(maxlen=n_obs_steps+1)
         self.reward = list()
-        self.done = list()
+        self.terminated = list()
+        self.truncated = list()
         self.info = defaultdict(lambda : deque(maxlen=n_obs_steps+1))
-    
-    def reset(self):
+
+    def reset(self, seed=None):
         """Resets the environment using kwargs."""
-        obs = super().reset()
+        if seed is None and hasattr(self, '_seed'):
+            seed = self._seed
+        obs, _ = super().reset(seed=seed)
 
         self.obs = deque([obs], maxlen=self.n_obs_steps+1)
         self.reward = list()
-        self.done = list()
+        self.terminated = list()
+        self.truncated = list()
         self.info = defaultdict(lambda : deque(maxlen=self.n_obs_steps+1))
 
         obs = self._get_obs(self.n_obs_steps)
-        return obs
+        return obs, dict()
 
     def step(self, action):
         """
         actions: (n_action_steps,) + action_shape
         """
         for act in action:
-            if len(self.done) > 0 and self.done[-1]:
+            if len(self.terminated) > 0 and (self.terminated[-1] or self.truncated[-1]):
                 # termination
                 break
-            observation, reward, done, info = super().step(act)
+            observation, reward, terminated, truncated, info = super().step(act)
 
             self.obs.append(observation)
             self.reward.append(reward)
             if (self.max_episode_steps is not None) \
                 and (len(self.reward) >= self.max_episode_steps):
                 # truncation
-                done = True
-            self.done.append(done)
+                truncated = True
+            self.terminated.append(terminated)
+            self.truncated.append(truncated)
             self._add_info(info)
 
         observation = self._get_obs(self.n_obs_steps)
         reward = aggregate(self.reward, self.reward_agg_method)
-        done = aggregate(self.done, 'max')
+        terminated = aggregate(self.terminated, 'max')
+        truncated = aggregate(self.truncated, 'max')
         info = dict_take_last_n(self.info, self.n_obs_steps)
-        return observation, reward, done, info
+        return observation, reward, terminated, truncated, info
 
     def _get_obs(self, n_steps=1):
         """
@@ -144,17 +150,21 @@ class MultiStepWrapper(gym.Wrapper):
     def _add_info(self, info):
         for key, value in info.items():
             self.info[key].append(value)
-    
+
+    def seed(self, seed=None):
+        """Seed the environment. Stores seed for next reset."""
+        self._seed = seed
+
     def get_rewards(self):
         return self.reward
-    
+
     def get_attr(self, name):
         return getattr(self, name)
 
     def run_dill_function(self, dill_fn):
         fn = dill.loads(dill_fn)
         return fn(self)
-    
+
     def get_infos(self):
         result = dict()
         for k, v in self.info.items():

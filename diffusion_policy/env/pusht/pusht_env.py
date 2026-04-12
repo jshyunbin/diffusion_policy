@@ -1,5 +1,5 @@
-import gym
-from gym import spaces
+import gymnasium as gym
+from gymnasium import spaces
 
 import collections
 import numpy as np
@@ -26,15 +26,16 @@ def pymunk_to_shapely(body, shapes):
     return geom
 
 class PushTEnv(gym.Env):
-    metadata = {"render.modes": ["human", "rgb_array"], "video.frames_per_second": 10}
+    metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 10, "video.frames_per_second": 10}
     reward_range = (0., 1.)
 
     def __init__(self,
-            legacy=False, 
+            legacy=False,
             block_cog=None, damping=None,
             render_action=True,
             render_size=96,
-            reset_to_state=None
+            reset_to_state=None,
+            fix_goal=True
         ):
         self._seed = None
         self.seed()
@@ -83,19 +84,21 @@ class PushTEnv(gym.Env):
         self.render_buffer = None
         self.latest_action = None
         self.reset_to_state = reset_to_state
+        self.fix_goal = fix_goal
     
-    def reset(self):
-        seed = self._seed
+    def reset(self, seed=None, options=None):
+        if seed is not None:
+            self.seed(seed)
         self._setup()
         if self.block_cog is not None:
             self.block.center_of_gravity = self.block_cog
         if self.damping is not None:
             self.space.damping = self.damping
-        
+
         # use legacy RandomState for compatibility
         state = self.reset_to_state
         if state is None:
-            rs = np.random.RandomState(seed=seed)
+            rs = np.random.RandomState(seed=self._seed)
             state = np.array([
                 rs.randint(50, 450), rs.randint(50, 450),
                 rs.randint(100, 400), rs.randint(100, 400),
@@ -103,8 +106,16 @@ class PushTEnv(gym.Env):
                 ])
         self._set_state(state)
 
+        if not self.fix_goal:
+            self.goal_pose = np.array([
+                float(self.np_random.integers(100, 400)),
+                float(self.np_random.integers(100, 400)),
+                float(self.np_random.uniform(-np.pi, np.pi))
+            ])
+
         observation = self._get_obs()
-        return observation
+        info = self._get_info()
+        return observation, info
 
     def step(self, action):
         dt = 1.0 / self.sim_hz
@@ -130,14 +141,15 @@ class PushTEnv(gym.Env):
         goal_area = goal_geom.area
         coverage = intersection_area / goal_area
         reward = np.clip(coverage / self.success_threshold, 0, 1)
-        done = coverage > self.success_threshold
+        terminated = coverage > self.success_threshold
+        truncated = False
 
         observation = self._get_obs()
         info = self._get_info()
 
-        return observation, reward, done, info
+        return observation, reward, terminated, truncated, info
 
-    def render(self, mode):
+    def render(self, mode='rgb_array'):
         return self._render_frame(mode)
 
     def teleop_agent(self):
