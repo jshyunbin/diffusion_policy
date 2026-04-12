@@ -9,7 +9,7 @@ task_name: ${task.name}
 shape_meta: ${task.shape_meta}
 exp_name: "default"
 
-horizon: 10
+horizon: 16
 n_obs_steps: 2
 n_action_steps: 8
 n_latency_steps: 0
@@ -64,14 +64,14 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 64
+  batch_size: 512
   num_workers: 0
   shuffle: True
   pin_memory: True
   persistent_workers: False
 
 val_dataloader:
-  batch_size: 64
+  batch_size: 512
   num_workers: 0
   shuffle: False
   pin_memory: True
@@ -114,8 +114,8 @@ logging:
   entity: jhyunbin
   resume: True
   mode: online
-  name: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
-  tags: ["${name}", "${task_name}", "${exp_name}"]
+  name: ${now:%m.%d}_diffusion_transformer_hybrid_${task_name}
+  tags: ["${task_name}", "pusht_multitask", "diffusion_transformer_hybrid"]
   id: null
   group: null
 
