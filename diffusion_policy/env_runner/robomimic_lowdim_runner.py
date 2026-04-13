@@ -257,7 +257,7 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
                 args_list=[(x,) for x in this_init_fns])
 
             # start rollout
-            obs = env.reset()
+            obs, _ = env.reset()
             past_action = None
             policy.reset()
 
@@ -302,8 +302,8 @@ class RobomimicLowdimRunner(BaseLowdimRunner):
                 if self.abs_action:
                     env_action = self.undo_transform_action(action)
 
-                obs, reward, done, info = env.step(env_action)
-                done = np.all(done)
+                obs, reward, terminated, truncated, info = env.step(env_action)
+                done = np.all(terminated | truncated)
                 past_action = action
 
                 # update pbar

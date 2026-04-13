@@ -201,7 +201,7 @@ class PushTImageRunner(BaseImageRunner):
 
                 # step env
                 obs, reward, terminated, truncated, info = env.step(action)
-                done = np.all(terminated) or np.all(truncated)
+                done = np.all(terminated | truncated)
                 past_action = action
 
                 # update pbar

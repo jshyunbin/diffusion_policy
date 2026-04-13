@@ -1,7 +1,7 @@
 from typing import List, Dict, Optional
 import numpy as np
-import gym
-from gym.spaces import Box
+import gymnasium as gym
+from gymnasium.spaces import Box
 from robomimic.envs.env_robosuite import EnvRobosuite
 
 class RobomimicLowdimWrapper(gym.Env):
@@ -55,7 +55,10 @@ class RobomimicLowdimWrapper(gym.Env):
         np.random.seed(seed=seed)
         self._seed = seed
     
-    def reset(self):
+    def reset(self, seed=None, options=None):
+        if seed is not None:
+            self.seed(seed)
+
         if self.init_state is not None:
             # always reset to the same state
             # to be compatible with gym
@@ -79,16 +82,16 @@ class RobomimicLowdimWrapper(gym.Env):
 
         # return obs
         obs = self.get_observation()
-        return obs
-    
+        return obs, {}
+
     def step(self, action):
         raw_obs, reward, done, info = self.env.step(action)
         obs = np.concatenate([
             raw_obs[key] for key in self.obs_keys
         ], axis=0)
-        return obs, reward, done, info
-    
-    def render(self, mode='rgb_array'):
+        return obs, reward, done, False, info
+
+    def render(self, **kwargs):
         h, w = self.render_hw
         return self.env.render(mode=mode, 
             height=h, width=w, 
