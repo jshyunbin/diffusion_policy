@@ -15,11 +15,11 @@ shape_meta: &shape_meta
 
 env_runner:
   _target_: diffusion_policy.env_runner.pusht_image_runner.PushTImageRunner
-  n_train: 6
-  n_train_vis: 2
+  n_train: 3
+  n_train_vis: 1
   train_start_seed: 0
-  n_test: 50
-  n_test_vis: 4
+  n_test: 22
+  n_test_vis: 3
   legacy_test: True
   test_start_seed: 100000
   max_steps: 300

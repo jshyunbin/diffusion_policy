@@ -1,0 +1,122 @@
+defaults:
+  - _self_
+  - task: pusht_image_multigoal
+
+name: train_act_hybrid
+_target_: diffusion_policy.workspace.train_act_hybrid_workspace.TrainACTHybridWorkspace
+
+task_name: ${task.name}
+shape_meta: ${task.shape_meta}
+exp_name: "default"
+
+horizon: 16
+n_obs_steps: 2
+n_action_steps: 8
+n_latency_steps: 0
+dataset_obs_steps: ${n_obs_steps}
+past_action_visible: False
+keypoint_visible_rate: 1.0
+obs_as_cond: True
+
+policy:
+  _target_: diffusion_policy.policy.act_hybrid_image_policy.ACTHybridImagePolicy
+
+  shape_meta: ${shape_meta}
+
+  horizon: ${horizon}
+  n_action_steps: ${eval:'${n_action_steps}+${n_latency_steps}'}
+  n_obs_steps: ${n_obs_steps}
+
+  crop_shape: [76, 76]
+  obs_encoder_group_norm: True
+  eval_fixed_crop: True
+
+  n_layer: 4
+  n_head: 8
+  n_emb: 256
+  p_drop: 0.1
+  latent_dim: 32
+  kl_weight: 10.0
+
+ema:
+  _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
+  update_after_step: 0
+  inv_gamma: 1.0
+  power: 0.75
+  min_value: 0.0
+  max_value: 0.9999
+
+dataloader:
+  batch_size: 64
+  num_workers: 0
+  shuffle: True
+  pin_memory: True
+  persistent_workers: False
+
+val_dataloader:
+  batch_size: 64
+  num_workers: 0
+  shuffle: False
+  pin_memory: True
+  persistent_workers: False
+
+optimizer:
+  transformer_weight_decay: 1.0e-3
+  obs_encoder_weight_decay: 1.0e-6
+  learning_rate: 1.0e-4
+  betas: [0.9, 0.95]
+
+training:
+  device: "cuda:0"
+  seed: 42
+  debug: False
+  resume: True
+  # optimization
+  lr_scheduler: cosine
+  lr_warmup_steps: 1000
+  num_epochs: 3050
+  gradient_accumulate_every: 1
+  use_ema: True
+  # training loop control
+  # in epochs
+  rollout_every: 50
+  checkpoint_every: 50
+  val_every: 1
+  sample_every: 5
+  # steps per epoch
+  max_train_steps: null
+  max_val_steps: null
+  # misc
+  tqdm_interval_sec: 1.0
+
+logging:
+  project: recursive-reasoning-robot-policy
+  entity: jhyunbin
+  resume: True
+  mode: online
+  name: ${now:%m.%d}_${name}_${task_name}
+  tags: ["${task_name}", "${name}"]
+  id: null
+  group: null
+
+checkpoint:
+  topk:
+    monitor_key: test_mean_score
+    mode: max
+    k: 5
+    format_str: 'epoch={epoch:04d}-test_mean_score={test_mean_score:.3f}.ckpt'
+  save_last_ckpt: True
+  save_last_snapshot: False
+
+multi_run:
+  run_dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  wandb_name_base: ${now:%Y.%m.%d-%H.%M.%S}_${name}_${task_name}
+
+hydra:
+  job:
+    override_dirname: ${name}
+  run:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+  sweep:
+    dir: data/outputs/${now:%Y.%m.%d}/${now:%H.%M.%S}_${name}_${task_name}
+    subdir: ${hydra.job.num}
