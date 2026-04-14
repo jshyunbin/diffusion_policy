@@ -35,6 +35,8 @@ policy:
   n_head: 8
   n_emb: 256
   p_drop: 0.1
+
+  # CVAE
   latent_dim: 32
   kl_weight: 10.0
 
@@ -47,14 +49,14 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 64
+  batch_size: 512
   num_workers: 0
   shuffle: True
   pin_memory: True
   persistent_workers: False
 
 val_dataloader:
-  batch_size: 64
+  batch_size: 512
   num_workers: 0
   shuffle: False
   pin_memory: True
