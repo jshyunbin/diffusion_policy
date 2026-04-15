@@ -1,3 +1,9 @@
+**Status:** v2 — fixed spec, not implemented yet
+
+**Key Changes:** Causal masking removal, latent states, recursion steps, y update, loss
+
+**Last updated:** [2026-04-15]
+
 # Task: Implement GRAM-ACT (`GRAMHybridImagePolicy`) for Multi-Goal PushT
 
 You are extending an existing prototype `GRAMHybridImagePolicy` class in a fork of the
@@ -57,72 +63,118 @@ Hidden size: 512 (default — make configurable).
 The same 2-layer network is applied repeatedly during recursion. Do NOT instantiate
 multiple copies — there is one shared 2-layer block that gets reused.
 
-### Causal masking decision
-Apply causal masking on the self-attention. Even though the action chunk is generated
-in one shot (not autoregressively), causal masking respects temporal ordering of
-actions and matches GRAM's positional handling. The whole chunk is produced in
-parallel — causal masking just shapes the attention pattern.
+### No causal masking on self-attention
+The action chunk is generated in one shot via parallel refinement, not autoregressively. 
+All action positions attend to all other action positions bidirectionally. This matches 
+GRAM's handling of structured outputs (Sudoku grids) and ACT's parallel action chunk 
+generation.
 
 ### Latent states
 Maintain two latent tensors per recursion:
 - `y`: shape `[B, T_action, D]` — the predicted action chunk in latent space
-- `z`: shape `[B, T_action, D]` — the reasoning latent
+  (this is the STOCHASTIC latent — gets sampled at each recursion step)
+- `z`: shape `[B, T_action, D]` — the reasoning latent (deterministic)
 
 Both are initialized at the start of inference from a fixed truncated normal
 (std=1, truncation=2). Initialize once per forward pass; do NOT re-initialize per
 recursion step.
 
-### Recursion step (deterministic TRM-style for reference)
+### Recursion step (GRAM with variational stochastic guidance)
+
+GRAM is a **variational generative model**. It has TWO networks predicting the
+distribution over the next `y`:
+
+- **Prior network** `p_θ`: predicts `(μ_p, σ_p)` WITHOUT access to ground truth.
+  Used at both training and inference.
+- **Posterior network** `q_φ`: predicts `(μ_q, σ_q)` WITH access to ground truth
+  action chunk. Used at training time only.
+
+Both networks share the same 2-layer transformer block backbone (this is GRAM's
+"single tiny network" property — DO NOT instantiate two separate transformers).
+The difference is in their inputs:
+
 ```
-def latent_recursion(obs_tokens, y, z, n=6):
+# Prior path (no ground truth)
+u_prior = block(y + z + cross_attn(obs_tokens))
+μ_p = linear_mu_prior(u_prior)
+σ_p = softplus(linear_sigma_prior(u_prior)) + ε_min   # ensure positive
+
+# Posterior path (with ground truth action embedding a_gt_emb)
+u_post = block(y + z + cross_attn(obs_tokens) + a_gt_emb)
+μ_q = linear_mu_post(u_post)
+σ_q = softplus(linear_sigma_post(u_post)) + ε_min
+```
+
+Where `a_gt_emb` is an embedding of the ground truth action chunk (project
+ground truth actions through a linear layer to dimension `D`, then add to the
+block input). At inference time, posterior path is not used.
+
+### Stochastic update of y (residual formulation)
+
+The new `y` is sampled using reparameterization, in residual form:
+
+```
+# At training time, sample from posterior
+ε ~ N(0, I)
+y_new = u_post + σ_q * ε        # residual: deterministic update + scaled noise
+
+# At inference time, sample from prior
+ε ~ N(0, I)
+y_new = u_prior + σ_p * ε
+```
+
+Critical: this is a RESIDUAL formulation. The deterministic update `u` is
+preserved and noise is added on top. Do NOT replace with direct sampling
+`y_new ~ N(μ, σ²)` — this is known to be unstable.
+
+The reasoning latent z is updated DETERMINISTICALLY using the same shared block:
+
+```
+z_new = block(z + y_new + cross_attn(obs_tokens))
+```
+
+(Note: z update happens AFTER y is sampled, and uses the new y.)
+
+### Full recursion step
+
+```python
+def latent_recursion(obs_tokens, y, z, n=6, a_gt_emb=None, training=True):
     for i in range(n):
-        # Update reasoning latent z, conditioned on obs, y, z
-        z = block(z + y + cross_attn_input(obs_tokens))
-    # Update prediction latent y, conditioned on z and y (NOT obs)
-    y = block(y + z)
-    return y, z
+        # Predict prior parameters (always)
+        u_prior = block(y + z + cross_attn(obs_tokens))
+        mu_p = linear_mu_prior(u_prior)
+        sigma_p = softplus(linear_sigma_prior(u_prior)) + 1e-4
+        
+        if training and a_gt_emb is not None:
+            # Predict posterior parameters (training only)
+            u_post = block(y + z + cross_attn(obs_tokens) + a_gt_emb)
+            mu_q = linear_mu_post(u_post)
+            sigma_q = softplus(linear_sigma_post(u_post)) + 1e-4
+            
+            # Sample from posterior using reparameterization
+            eps = torch.randn_like(mu_q)
+            y = mu_q + sigma_q * eps
+            
+            # Accumulate KL divergence between posterior and prior
+            kl = kl_divergence_gaussian(mu_q, sigma_q, mu_p, sigma_p)
+            kl_total += kl.mean()
+        else:
+            # Inference: sample from prior
+            eps = torch.randn_like(mu_p)
+            y = mu_p + sigma_p * eps
+        
+        # Update reasoning latent deterministically
+        z = block(z + y + cross_attn(obs_tokens))
+    
+    return y, z, kl_total
 ```
 
-Note: `z` updates see the observation context; `y` updates do NOT. This asymmetry
-is load-bearing — it forces `y` to integrate observation information through `z`.
-Do not break it.
-
-### GRAM stochastic guidance (the key generative addition)
-GRAM modifies the deterministic update by injecting learned-scale Gaussian noise
-into the latent transition. Replace `z = block(...)` with:
-
+The KL term per step:
 ```
-u = block(z + y + cross_attn_input(obs_tokens))   # deterministic update
-ε ~ N(0, σ² I)                                      # sampled noise
-z = u + ε                                           # residual stochastic guidance
+KL(q || p) = log(σ_p / σ_q) + (σ_q² + (μ_q - μ_p)²) / (2 σ_p²) - 0.5
 ```
+Sum across recursion steps and across the action chunk dimension; mean across batch.
 
-The noise is added to the OUTPUT of the block (residual formulation), not to the
-input. The noise scale `σ` should be a learned parameter (one scalar, or one per
-hidden dim — start with a scalar). Initialize `σ` to a small value like 0.1.
-
-Critically: do NOT replace `z = u + ε` with `z ~ N(μ_θ, σ²_θ I)` (i.e., direct
-sampling from a learned Gaussian). The residual formulation `u + ε` is what makes
-GRAM stable. Direct sampling is known to underperform.
-
-### Deep supervision (recursion across multiple supervision steps)
-GRAM uses "deep supervision": the recursion is wrapped in an outer loop where the
-final `(y, z)` from one recursion is detached and used as the initialization for
-the next, with a loss applied at each supervision step.
-
-```
-def deep_recursion(obs_tokens, y, z, n=6, T=3):
-    # Run T-1 recursions WITHOUT gradients
-    with torch.no_grad():
-        for _ in range(T-1):
-            y, z = latent_recursion(obs_tokens, y, z, n)
-    # Final recursion WITH gradients
-    y, z = latent_recursion(obs_tokens, y, z, n)
-    return y, z
-```
-
-For training, wrap this in an outer supervision loop (`N_sup = 16`), where each
-iteration applies the loss and detaches latents. See the loss section.
 
 ### Output head
 A single linear projection from the final `y` to action dimension. No Gaussian head
@@ -177,22 +229,33 @@ Implement cleanly so this is a single config change.
 
 ## Loss specification
 
-Total loss per supervision step `m`:
+Total loss per supervision step:
 
 ```
-L_total = L_action + L_q + L_kl_gram + L_cvae_kl (if use_cvae)
+L_total = L_action + L_q + β_kl * L_kl_variational + L_cvae_kl (if use_cvae)
 ```
 
 Where:
 - `L_action`: L2 loss between predicted and ground-truth action chunks.
-  `F.mse_loss(action_pred, action_gt)` with reduction='mean'.
-- `L_q`: BCE loss for Q-head as described above. Weight: 0.5 (matches GRAM/HRM).
-- `L_kl_gram`: KL regularization on the noise scale, encouraging it to remain
-  non-trivial. Add a small term: `kl_weight_gram * (sigma**2 - log(sigma**2) - 1)` 
-  to prevent noise collapse. Default `kl_weight_gram = 0.01`. (This is a simple
-  free-bits-style regularizer to prevent σ → 0.)
-- `L_cvae_kl`: standard KL between CVAE encoder posterior and N(0, I). Only when
-  `use_cvae=True`.
+- `L_q`: BCE loss for Q-head, weight 0.5.
+- `L_kl_variational`: accumulated KL(q_φ || p_θ) across all recursion steps,
+  with weight `β_kl` (default 0.001 — start small to avoid posterior collapse,
+  may need to anneal up).
+- `L_cvae_kl`: only when `use_cvae=True`, standard CVAE KL term.
+
+Remove the previous `L_kl_gram` (free-bits regularizer on σ) — it was a hack
+that's no longer needed now that we have proper variational training. The
+KL(q || p) term naturally regularizes the noise scale.
+
+**Posterior collapse warning**: Variational models with strong reconstruction
+losses tend to collapse the posterior to match the prior (so KL→0) and ignore
+the latent. Watch for this by monitoring KL value during training. If KL → 0
+and reconstruction is poor, you're collapsing. Mitigations:
+- KL annealing: start `β_kl = 0`, ramp up to 0.001 over first 10k steps
+- Free bits: clip KL to a minimum value per dimension (e.g., max(KL, 0.1))
+- Lower `β_kl` further
+
+Start without these mitigations and add them only if you see collapse.
 
 **Deep supervision loop** (this is the outer training loop, conceptually):
 
