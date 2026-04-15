@@ -158,11 +158,18 @@ class TrainGRAMHybridWorkspace(BaseWorkspace):
 
                         # compute loss
                         raw_loss = self.model.compute_loss(batch)
-                        loss = raw_loss / cfg.training.gradient_accumulate_every
-                        loss.backward()
+                        # GRAM does backward internally (returns float);
+                        # other policies return a tensor needing backward.
+                        if isinstance(raw_loss, torch.Tensor) and raw_loss.requires_grad:
+                            loss = raw_loss / cfg.training.gradient_accumulate_every
+                            loss.backward()
 
                         # step optimizer
                         if self.global_step % cfg.training.gradient_accumulate_every == 0:
+                            grad_clip = getattr(cfg.training, 'grad_clip', None)
+                            if grad_clip is not None:
+                                torch.nn.utils.clip_grad_norm_(
+                                    self.model.parameters(), grad_clip)
                             self.optimizer.step()
                             self.optimizer.zero_grad()
                             lr_scheduler.step()
@@ -172,7 +179,7 @@ class TrainGRAMHybridWorkspace(BaseWorkspace):
                             ema.step(self.model)
 
                         # logging
-                        raw_loss_cpu = raw_loss.item()
+                        raw_loss_cpu = raw_loss if isinstance(raw_loss, float) else raw_loss.item()
                         tepoch.set_postfix(loss=raw_loss_cpu, refresh=False)
                         train_losses.append(raw_loss_cpu)
                         step_log = {

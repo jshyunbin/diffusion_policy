@@ -31,14 +31,34 @@ policy:
   obs_encoder_group_norm: True
   eval_fixed_crop: True
 
-  n_layer: 4
-  n_head: 8
-  n_emb: 256
-  p_drop: 0.1
+  # GRAM decoder architecture
+  hidden_dim: 512
+  n_decoder_layers: 2
+  n_heads: 8
+  ffn_expansion: 4
 
-  # GRAM reasoning
-  n_reasoning_steps: 8
-  n_reasoning_steps_train: 16
+  # Recursion
+  n_recursion: 6
+  T_recursion: 3
+  N_sup: 16
+
+  # Stochastic guidance
+  sigma_init: 0.1
+  kl_weight_gram: 0.01
+
+  # Q-head
+  use_q_head: true
+  q_loss_weight: 0.5
+  success_threshold: 0.05
+
+  # CVAE (optional — set true for ACT-style initialization)
+  use_cvae: false
+  latent_dim: 32
+  kl_weight: 10.0
+
+  # Inference
+  inference_n_sup: 8
+  inference_use_q_halting: false
 
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
@@ -46,7 +66,7 @@ ema:
   inv_gamma: 1.0
   power: 0.75
   min_value: 0.0
-  max_value: 0.9999
+  max_value: 0.999
 
 dataloader:
   batch_size: 64
@@ -63,7 +83,7 @@ val_dataloader:
   persistent_workers: False
 
 optimizer:
-  transformer_weight_decay: 1.0e-3
+  transformer_weight_decay: 1.0
   obs_encoder_weight_decay: 1.0e-6
   learning_rate: 1.0e-4
   betas: [0.9, 0.95]
@@ -75,10 +95,11 @@ training:
   resume: True
   # optimization
   lr_scheduler: cosine
-  lr_warmup_steps: 1000
-  num_epochs: 3050
+  lr_warmup_steps: 2000
+  num_epochs: 200
   gradient_accumulate_every: 1
   use_ema: True
+  grad_clip: 1.0
   # training loop control
   # in epochs
   rollout_every: 50
