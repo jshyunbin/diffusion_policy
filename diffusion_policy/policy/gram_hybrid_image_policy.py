@@ -296,7 +296,7 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
         KL is computed ONLY at the final outer step; earlier KL terms contribute zero
         gradient under truncation (paper Eq. 26-27).
 
-        y update (residual): y = u_post/u_prior + σ * ε  (NOT y = μ + σ*ε)
+        y update (residual): y = u + μ + σ * ε  (NOT y = μ + σ*ε)
         μ heads are used only for the KL term, not for the y sample itself.
 
         Returns: (y, z, kl_scalar)
@@ -312,20 +312,18 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
 
                 # Stochastic y-update — same distribution as the final step so
                 # the warm-up reaches a realistic (y, z) starting state
-                u_prior = self.block(y + z, memory=obs_tokens, freqs_cis=self.freqs_cis)
-                mu_p = self.linear_mu_prior(u_prior)
-                sigma_p = F.softplus(self.linear_sigma_prior(u_prior)) + self.sigma_min
+                u = self.block(y + z, memory=obs_tokens, freqs_cis=self.freqs_cis)
+                mu_p = self.linear_mu_prior(u)
+                sigma_p = F.softplus(self.linear_sigma_prior(u)) + self.sigma_min
 
                 if a_gt_emb is not None:
-                    u_post = self.block(
-                        y + z + a_gt_emb, memory=obs_tokens, freqs_cis=self.freqs_cis)
-                    mu_q = self.linear_mu_post(u_post)
-                    sigma_q = F.softplus(self.linear_sigma_post(u_post)) + self.sigma_min
+                    mu_q = self.linear_mu_post(u + a_gt_emb)
+                    sigma_q = F.softplus(self.linear_sigma_post(u + a_gt_emb)) + self.sigma_min
                     eps = torch.randn_like(mu_q)
-                    y = u_post + mu_q + sigma_q * eps   # residual + learned mean + noise
+                    y = u + mu_q + sigma_q * eps   # residual + learned mean + noise
                 else:
                     eps = torch.randn_like(mu_p)
-                    y = u_prior + mu_p + sigma_p * eps
+                    y = u + mu_p + sigma_p * eps
 
         # ------------------------------------------------------------------
         # Final outer step WITH gradients — loss and KL live here
@@ -333,23 +331,21 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
         for _ in range(K):
             z = self.block(z + y, memory=obs_tokens, freqs_cis=self.freqs_cis)
 
-        u_prior = self.block(y + z, memory=obs_tokens, freqs_cis=self.freqs_cis)
-        mu_p = self.linear_mu_prior(u_prior)
-        sigma_p = F.softplus(self.linear_sigma_prior(u_prior)) + self.sigma_min
+        u = self.block(y + z, memory=obs_tokens, freqs_cis=self.freqs_cis)
+        mu_p = self.linear_mu_prior(u)
+        sigma_p = F.softplus(self.linear_sigma_prior(u)) + self.sigma_min
 
         if a_gt_emb is not None:
-            u_post = self.block(
-                y + z + a_gt_emb, memory=obs_tokens, freqs_cis=self.freqs_cis)
-            mu_q = self.linear_mu_post(u_post)
-            sigma_q = F.softplus(self.linear_sigma_post(u_post)) + self.sigma_min
+            mu_q = self.linear_mu_post(u + a_gt_emb)
+            sigma_q = F.softplus(self.linear_sigma_post(u + a_gt_emb)) + self.sigma_min
             eps = torch.randn_like(mu_q)
-            y = u_post + mu_q + sigma_q * eps   # residual + learned mean + noise
+            y = u + mu_q + sigma_q * eps   # residual + learned mean + noise
 
             # KL only at the final step — truncated ELBO
             kl = self._kl_balanced(mu_q, sigma_q, mu_p, sigma_p).mean()
         else:
             eps = torch.randn_like(mu_p)
-            y = u_prior + mu_p + sigma_p * eps
+            y = u + mu_p + sigma_p * eps
             kl = torch.tensor(0.0, device=obs_tokens.device)
 
         return y, z, kl
