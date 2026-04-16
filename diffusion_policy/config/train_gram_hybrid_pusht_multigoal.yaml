@@ -53,7 +53,7 @@ policy:
   kl_weight: 10.0
 
   # Inference
-  inference_n_sup: 8
+  inference_n_sup: 16
 
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
@@ -64,14 +64,14 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 64
+  batch_size: 256
   num_workers: 0
   shuffle: True
   pin_memory: True
   persistent_workers: False
 
 val_dataloader:
-  batch_size: 64
+  batch_size: 256
   num_workers: 0
   shuffle: False
   pin_memory: True
