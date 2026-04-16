@@ -124,16 +124,18 @@ The new `y` is sampled using reparameterization, in residual form:
 ```
 # At training time, sample from posterior
 ε ~ N(0, I)
-y_new = u_post + σ_q * ε        # residual: deterministic update + scaled noise
+y_new = u_post + μ_q + σ_q * ε   # residual u + learned mean delta + noise
 
 # At inference time, sample from prior
 ε ~ N(0, I)
-y_new = u_prior + σ_p * ε
+y_new = u_prior + μ_p + σ_p * ε
 ```
 
-Critical: this is a RESIDUAL formulation. The deterministic update `u` is
-preserved and noise is added on top. Do NOT replace with direct sampling
-`y_new ~ N(μ, σ²)` — this is known to be unstable.
+Critical: this is a RESIDUAL formulation. The block output `u` is preserved as
+the base; the Gaussian head (μ, σ) adds a learned correction on top. The KL term
+regularizes only the Gaussian delta N(μ_q, σ_q²) vs N(μ_p, σ_p²), not the full
+distribution including `u`. Do NOT replace with direct sampling `y_new ~ N(μ, σ²)`
+— omitting the residual `u` is known to be unstable.
 
 The reasoning latent z is updated DETERMINISTICALLY using the same shared block:
 
@@ -187,10 +189,10 @@ def latent_recursion(obs_tokens, y, z, n=3, K=4, a_gt_emb=None, training=True):
                 mu_q = linear_mu_post(u_post)
                 sigma_q = softplus(linear_sigma_post(u_post)) + 1e-4
                 eps = torch.randn_like(mu_q)
-                y = u_post + sigma_q * eps
+                y = u_post + mu_q + sigma_q * eps
             else:
                 eps = torch.randn_like(mu_p)
-                y = u_prior + sigma_p * eps
+                y = u_prior + mu_p + sigma_p * eps
     
     # ---------------------------------------------------------------
     # Final outer step WITH gradients — this is where the loss lives
@@ -210,13 +212,13 @@ def latent_recursion(obs_tokens, y, z, n=3, K=4, a_gt_emb=None, training=True):
         sigma_q = softplus(linear_sigma_post(u_post)) + 1e-4
         
         eps = torch.randn_like(mu_q)
-        y = u_post + sigma_q * eps
+        y = u_post + mu_q + sigma_q * eps
         
         # KL ONLY at the final step (truncated ELBO)
         kl = kl_balanced(mu_q, sigma_q, mu_p, sigma_p, alpha=0.8).mean()
     else:
         eps = torch.randn_like(mu_p)
-        y = u_prior + sigma_p * eps
+        y = u_prior + mu_p + sigma_p * eps
         kl = torch.tensor(0.0, device=y.device)
     
     return y, z, kl

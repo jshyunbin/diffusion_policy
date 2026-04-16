@@ -316,10 +316,10 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
                     mu_q = self.linear_mu_post(u_post)
                     sigma_q = F.softplus(self.linear_sigma_post(u_post)) + self.sigma_min
                     eps = torch.randn_like(mu_q)
-                    y = u_post + sigma_q * eps   # residual: block output + scaled noise
+                    y = u_post + mu_q + sigma_q * eps   # residual + learned mean + noise
                 else:
                     eps = torch.randn_like(mu_p)
-                    y = u_prior + sigma_p * eps
+                    y = u_prior + mu_p + sigma_p * eps
 
         # ------------------------------------------------------------------
         # Final outer step WITH gradients — loss and KL live here
@@ -337,13 +337,13 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
             mu_q = self.linear_mu_post(u_post)
             sigma_q = F.softplus(self.linear_sigma_post(u_post)) + self.sigma_min
             eps = torch.randn_like(mu_q)
-            y = u_post + sigma_q * eps   # residual: block output + scaled noise
+            y = u_post + mu_q + sigma_q * eps   # residual + learned mean + noise
 
             # KL only at the final step — truncated ELBO
             kl = self._kl_balanced(mu_q, sigma_q, mu_p, sigma_p).mean()
         else:
             eps = torch.randn_like(mu_p)
-            y = u_prior + sigma_p * eps
+            y = u_prior + mu_p + sigma_p * eps
             kl = torch.tensor(0.0, device=obs_tokens.device)
 
         return y, z, kl
