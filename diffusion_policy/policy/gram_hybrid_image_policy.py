@@ -161,6 +161,16 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
         freqs_cis = precompute_freqs_cis(head_dim, max_seq_len=horizon)
         self.register_buffer('freqs_cis', freqs_cis)
 
+        # ========= Fixed initial latent states (buffers, not trained) =========
+        # Sampled once at construction from truncated normal; same starting point
+        # for every forward pass, duplicated to batch size at runtime.
+        y_init = torch.empty(1, horizon, hidden_dim)
+        z_init = torch.empty(1, horizon, hidden_dim)
+        nn.init.trunc_normal_(y_init, std=1.0, a=-2.0, b=2.0)
+        nn.init.trunc_normal_(z_init, std=1.0, a=-2.0, b=2.0)
+        self.register_buffer('y_init', y_init)
+        self.register_buffer('z_init', z_init)
+
         # ========= Variational heads (4 separate — only the block is shared) =========
         # Prior: predicts (μ_p, σ_p) without ground truth
         self.linear_mu_prior = nn.Linear(hidden_dim, hidden_dim, bias=False)
@@ -228,13 +238,9 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
         nobs_features = self.obs_encoder(this_nobs)
         return nobs_features.reshape(B, To, -1)
 
-    def init_latents(self, B, T, device):
-        """Initialize y and z from truncated normal (std=1, truncation=2)."""
-        y = torch.empty(B, T, self.hidden_dim, device=device)
-        z = torch.empty(B, T, self.hidden_dim, device=device)
-        nn.init.trunc_normal_(y, std=1.0, a=-2.0, b=2.0)
-        nn.init.trunc_normal_(z, std=1.0, a=-2.0, b=2.0)
-        return y, z
+    def init_latents(self, B):
+        """Return learned initial latents expanded to batch size B."""
+        return self.y_init.expand(B, -1, -1), self.z_init.expand(B, -1, -1)
 
     def encode_to_latent(self, obs_features, actions):
         """CVAE encoder: encode actions conditioned on obs → (mu, logvar, z_style).
@@ -360,7 +366,7 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
         obs_tokens = self.obs_proj(obs_features)
 
         # Initialize latents (truncated normal, or CVAE prior if use_cvae)
-        y, z = self.init_latents(B, self.horizon, device)
+        y, z = self.init_latents(B)
         if self.use_cvae:
             z_style = torch.randn(B, self.latent_dim, device=device)
             y = self.latent_out_proj(z_style).unsqueeze(1).expand(
@@ -402,7 +408,7 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
         obs_features = self.encode_obs(tiled_nobs, NB, To)
         obs_tokens = self.obs_proj(obs_features)
 
-        y, z = self.init_latents(NB, self.horizon, device)
+        y, z = self.init_latents(NB)
         if self.use_cvae:
             z_style = torch.randn(NB, self.latent_dim, device=device)
             y = self.latent_out_proj(z_style).unsqueeze(1).expand(
@@ -477,7 +483,7 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
         a_gt_emb = self.action_embedding(nactions)  # [B, T_horizon, D]
 
         # Initialize latents
-        y, z = self.init_latents(B, self.horizon, nactions.device)
+        y, z = self.init_latents(B)
 
         # Optional CVAE initialization
         cvae_kl = None
