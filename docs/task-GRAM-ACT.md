@@ -1,12 +1,8 @@
-**Status:** v3 — Q-head removed, EMA/KL values corrected, training loop cleaned up
+**Status:** v4 — Adding K inner loop. Using truncated ELBO
 
-**Key Changes from v2:**
-- Q-head removed entirely (not in GRAM's training objective per paper inspection)
-- EMA decay updated to 0.9999 (GRAM's value, not TRM's 0.999)
-- KL balance coefficient added (Hafner et al. trick used in GRAM, coefficient 0.8)
-- Training loop simplified — no halting logic
-- Config updated to remove all Q-head parameters
-- V-head / LPRM noted as future work, not v1
+**Key Changes from v3:**
+- Using K inner loops when updating `z`
+- Using stop grad when running the first n-1 outer loop
 
 **Last updated:** [2026-04-16]
 
@@ -149,38 +145,101 @@ z_new = block(z + y_new + cross_attn(obs_tokens))
 
 ### Full recursion step
 
-```python
-def latent_recursion(obs_tokens, y, z, n=6, a_gt_emb=None, training=True):
-    kl_total = 0.0
-    for i in range(n):
-        # Predict prior parameters (always)
-        u_prior = block(y + z + cross_attn(obs_tokens))
-        mu_p = linear_mu_prior(u_prior)
-        sigma_p = softplus(linear_sigma_prior(u_prior)) + 1e-4
-        
-        if training and a_gt_emb is not None:
-            # Predict posterior parameters (training only)
-            u_post = block(y + z + cross_attn(obs_tokens) + a_gt_emb)
-            mu_q = linear_mu_post(u_post)
-            sigma_q = softplus(linear_sigma_post(u_post)) + 1e-4
+The recursion has two nested loops per outer step:
+- **Inner loop (K times)**: deterministic updates to the low-level latent `z`, 
+  conditioned on the current high-level latent `y`.
+- **Outer update (once per step)**: stochastic update to the high-level latent `y`,
+  using the refined `z`.
+
+Per GRAM's truncated ELBO (Appendix C.1 of the paper), gradients only flow through
+the **final outer step**. The first `n-1` outer steps run under `torch.no_grad()`,
+and the KL term is computed ONLY for the final step. This is mathematically
+equivalent to the full ELBO because the earlier KL terms contribute zero gradient
+under truncation (the detach blocks both direct and indirect gradient paths to
+θ and φ for t < T — see the paper's equations 26-27).
+
+````python
+def latent_recursion(obs_tokens, y, z, n=3, K=4, a_gt_emb=None, training=True):
+    """
+    n outer steps = (n-1) no-grad warm-up + 1 final step with gradients.
+    Each outer step = K deterministic z-updates + 1 stochastic y-update.
+    KL is computed only on the final outer step (truncated ELBO).
+    """
+    # ---------------------------------------------------------------
+    # Warm-up: n-1 outer steps without gradients
+    # These refine (y, z) but do not contribute to the loss gradient.
+    # ---------------------------------------------------------------
+    with torch.no_grad():
+        for i in range(n - 1):
+            # K deterministic z-updates
+            for k in range(K):
+                z = block(z + y + cross_attn(obs_tokens))
             
-            # Sample from posterior using reparameterization
-            eps = torch.randn_like(mu_q)
-            y = mu_q + sigma_q * eps
+            # Stochastic y-update (sample from posterior if training,
+            # prior otherwise — matches what the final step will do,
+            # so the warm-up reaches a realistic starting state)
+            u_prior = block(y + z + cross_attn(obs_tokens))
+            mu_p = linear_mu_prior(u_prior)
+            sigma_p = softplus(linear_sigma_prior(u_prior)) + 1e-4
             
-            # Accumulate KL divergence with KL balancing (see loss section)
-            kl = kl_balanced(mu_q, sigma_q, mu_p, sigma_p, alpha=0.8)
-            kl_total += kl.mean()
-        else:
-            # Inference: sample from prior
-            eps = torch.randn_like(mu_p)
-            y = mu_p + sigma_p * eps
-        
-        # Update reasoning latent deterministically
+            if training and a_gt_emb is not None:
+                u_post = block(y + z + cross_attn(obs_tokens) + a_gt_emb)
+                mu_q = linear_mu_post(u_post)
+                sigma_q = softplus(linear_sigma_post(u_post)) + 1e-4
+                eps = torch.randn_like(mu_q)
+                y = u_post + sigma_q * eps
+            else:
+                eps = torch.randn_like(mu_p)
+                y = u_prior + sigma_p * eps
+    
+    # ---------------------------------------------------------------
+    # Final outer step WITH gradients — this is where the loss lives
+    # ---------------------------------------------------------------
+    # K deterministic z-updates (gradients flow through f_L)
+    for k in range(K):
         z = block(z + y + cross_attn(obs_tokens))
     
-    return y, z, kl_total
-```
+    # Stochastic y-update (gradients flow through f_H and reparam)
+    u_prior = block(y + z + cross_attn(obs_tokens))
+    mu_p = linear_mu_prior(u_prior)
+    sigma_p = softplus(linear_sigma_prior(u_prior)) + 1e-4
+    
+    if training and a_gt_emb is not None:
+        u_post = block(y + z + cross_attn(obs_tokens) + a_gt_emb)
+        mu_q = linear_mu_post(u_post)
+        sigma_q = softplus(linear_sigma_post(u_post)) + 1e-4
+        
+        eps = torch.randn_like(mu_q)
+        y = u_post + sigma_q * eps
+        
+        # KL ONLY at the final step (truncated ELBO)
+        kl = kl_balanced(mu_q, sigma_q, mu_p, sigma_p, alpha=0.8).mean()
+    else:
+        eps = torch.randn_like(mu_p)
+        y = u_prior + sigma_p * eps
+        kl = torch.tensor(0.0, device=y.device)
+    
+    return y, z, kl
+````
+
+Key points:
+- The first `n-1` outer steps are wrapped in `torch.no_grad()` (equivalent to
+  but more efficient than detaching after the fact — no graph is built).
+- The final outer step runs with gradients and produces the single KL term 
+  that goes into the loss. This is the truncated ELBO from equation (13) of 
+  the paper.
+- The warm-up steps sample from the same distribution (posterior during 
+  training, prior during inference) so that the final step receives a 
+  realistic `(y, z)` initialization. This is what the paper's Appendix C.1
+  derivation assumes.
+- At inference, the distinction between warm-up and final step is moot since 
+  no gradients are computed anywhere — but the structure is preserved for 
+  code simplicity. You may want to unify into a single loop for inference 
+  in the actual implementation.
+- `n` here is what the paper calls `T` (number of outer recursion steps per
+  supervision step). Default n=3 matches our earlier setting.
+- `K` is the number of low-level refinement inner steps per outer step.
+  Default K=4.
 
 ### KL divergence with KL balancing
 
@@ -367,6 +426,7 @@ def predict_action(self, obs):
         y, z, _ = self.latent_recursion(
             obs_tokens, y, z, 
             n=self.n_recursion, 
+            K=self.k_recursion,
             a_gt_emb=None,         # no ground truth at inference
             training=False,
         )
