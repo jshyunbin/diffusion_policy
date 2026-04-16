@@ -492,6 +492,7 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
 
         total_loss = 0.0
         total_kl = 0.0
+        total_mse = 0.0
 
         for sup_step in range(self.N_sup):
             # Variational recursion — uses posterior at training, prior at inference
@@ -517,9 +518,14 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
 
             total_loss += step_loss.item()
             total_kl += kl.item()
+            total_mse += l2_loss.item()
 
             # Detach: no BPTT across supervision steps
             y = y.detach()
             z = z.detach()
 
-        return {'loss': total_loss, 'kl_loss': total_kl / self.N_sup}
+        return {
+            'loss': total_loss,
+            'kl_loss': total_kl / self.N_sup,
+            'mse_loss': total_mse / self.N_sup,
+        }
