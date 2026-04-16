@@ -37,8 +37,9 @@ policy:
   n_heads: 8
   ffn_expansion: 4
 
-  # Recursion (T_recursion removed in v3 — fixed at 1)
-  n_recursion: 6
+  # Recursion
+  n_recursion: 3    # outer steps (n-1 warm-up + 1 final with gradients)
+  k_recursion: 4    # deterministic z-updates per outer step (inner loop)
   N_sup: 16
 
   # Variational training (GRAM-specific)

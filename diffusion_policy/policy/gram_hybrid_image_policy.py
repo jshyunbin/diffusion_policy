@@ -1,5 +1,5 @@
 """
-GRAM-ACT v3: Generative Recursive reAsoning Model for visuomotor policy learning.
+GRAM-ACT v4: Generative Recursive reAsoning Model for visuomotor policy learning.
 
 Variational recursive latent reasoning architecture adapted from GRAM for continuous
 action prediction. Key components:
@@ -8,17 +8,20 @@ action prediction. Key components:
 - GRAM decoder: shared 2-layer transformer block (RMSNorm post-norm, SwiGLU, RoPE,
   bidirectional self-attention) applied recursively
 - Dual latents:
-    y [B, T, D]: stochastic prediction latent — sampled at each recursion step
-    z [B, T, D]: deterministic reasoning latent — updated after y is sampled
+    y [B, T, D]: stochastic prediction latent — sampled once per outer step
+    z [B, T, D]: deterministic reasoning latent — refined K times per outer step
+- Recursion structure (per latent_recursion call):
+    Outer loop (n steps): K deterministic z-updates → 1 stochastic y-update
+    Truncated ELBO: first n-1 outer steps under torch.no_grad() (warm-up);
+    KL loss computed only at the final outer step (paper Appendix C.1, Eq. 26-27)
 - Variational training: prior p_θ(y) vs posterior q_φ(y|a_gt); only the 2-layer
   block is shared — the four (μ_p, σ_p, μ_q, σ_q) heads are separate Linear layers
 - KL balancing (Hafner et al. 2020) with α=0.8 prevents posterior collapse
-- Deep supervision: N_sup outer steps each with its own backward pass;
-  latents detached between steps (truncated ELBO, no BPTT across sup steps)
+- Deep supervision: N_sup steps with per-step backward; latents detached between steps
 - Optional CVAE for latent initialization (single flag for ablation)
 
 Reference: GRAM (Generative Recursive reAsoning Models), adapted for continuous
-visuomotor control on Multi-Goal PushT (v3 — Q-head removed, KL balancing added).
+visuomotor control on Multi-Goal PushT (v4 — K inner z-loop + truncated ELBO).
 """
 
 from typing import Dict, Tuple
@@ -55,7 +58,8 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
             n_heads=8,
             ffn_expansion=4,
             # recursion
-            n_recursion=6,
+            n_recursion=3,
+            k_recursion=4,
             N_sup=16,
             # variational (GRAM-specific)
             beta_kl=1.0,
@@ -199,6 +203,7 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
         self.n_action_steps = n_action_steps
         self.n_obs_steps = n_obs_steps
         self.n_recursion = n_recursion
+        self.k_recursion = k_recursion
         self.N_sup = N_sup
         self.beta_kl = beta_kl
         self.kl_balance_alpha = kl_balance_alpha
@@ -273,51 +278,75 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
 
     # ========= GRAM recursion =========
 
-    def latent_recursion(self, obs_tokens, y, z, n, a_gt_emb=None):
-        """GRAM variational recursion: n steps of stochastic y + deterministic z update.
+    def latent_recursion(self, obs_tokens, y, z, n, K, a_gt_emb=None):
+        """GRAM v4 variational recursion with K inner z-loop and truncated ELBO.
 
-        Prior path (training + inference): block(y+z, obs) → (μ_p, σ_p)
-        Posterior path (training only):    block(y+z+a_gt_emb, obs) → (μ_q, σ_q)
+        Structure per outer step:
+          - K deterministic z-updates: z = block(z+y, obs)  [low-level refinement]
+          - 1 stochastic y-update: sample from posterior (training) or prior (inference)
 
-        The 2-layer block is SHARED between prior and posterior (called twice per step
-        at training). The four (μ_p, σ_p, μ_q, σ_q) heads are NOT shared.
+        Truncated ELBO (Appendix C.1): first n-1 outer steps run under torch.no_grad()
+        as warm-up — they refine (y, z) to a realistic state but contribute no gradient.
+        KL is computed ONLY at the final outer step; earlier KL terms contribute zero
+        gradient under truncation (paper Eq. 26-27).
 
-        z is updated DETERMINISTICALLY after y is sampled, using the new y.
-        y sees obs only through z (asymmetry: z conditions on obs; y conditions on z).
+        y update (residual): y = u_post/u_prior + σ * ε  (NOT y = μ + σ*ε)
+        μ heads are used only for the KL term, not for the y sample itself.
 
-        Returns: (y, z, kl_total_scalar)
+        Returns: (y, z, kl_scalar)
         """
-        kl_total = torch.tensor(0.0, device=obs_tokens.device)
+        # ------------------------------------------------------------------
+        # Warm-up: first n-1 outer steps under no_grad (truncated ELBO)
+        # ------------------------------------------------------------------
+        with torch.no_grad():
+            for _ in range(n - 1):
+                # K deterministic z-updates (low-level latent refinement)
+                for _ in range(K):
+                    z = self.block(z + y, memory=obs_tokens, freqs_cis=self.freqs_cis)
 
-        for _ in range(n):
-            # Prior: predict (μ_p, σ_p) without ground truth
-            u_prior = self.block(y + z, memory=obs_tokens, freqs_cis=self.freqs_cis)
-            mu_p = self.linear_mu_prior(u_prior)
-            sigma_p = F.softplus(self.linear_sigma_prior(u_prior)) + self.sigma_min
+                # Stochastic y-update — same distribution as the final step so
+                # the warm-up reaches a realistic (y, z) starting state
+                u_prior = self.block(y + z, memory=obs_tokens, freqs_cis=self.freqs_cis)
+                mu_p = self.linear_mu_prior(u_prior)
+                sigma_p = F.softplus(self.linear_sigma_prior(u_prior)) + self.sigma_min
 
-            if a_gt_emb is not None:
-                # Posterior: predict (μ_q, σ_q) conditioned on ground truth embedding
-                u_post = self.block(
-                    y + z + a_gt_emb, memory=obs_tokens, freqs_cis=self.freqs_cis)
-                mu_q = self.linear_mu_post(u_post)
-                sigma_q = F.softplus(self.linear_sigma_post(u_post)) + self.sigma_min
+                if a_gt_emb is not None:
+                    u_post = self.block(
+                        y + z + a_gt_emb, memory=obs_tokens, freqs_cis=self.freqs_cis)
+                    mu_q = self.linear_mu_post(u_post)
+                    sigma_q = F.softplus(self.linear_sigma_post(u_post)) + self.sigma_min
+                    eps = torch.randn_like(mu_q)
+                    y = u_post + sigma_q * eps   # residual: block output + scaled noise
+                else:
+                    eps = torch.randn_like(mu_p)
+                    y = u_prior + sigma_p * eps
 
-                # Reparameterized sample from posterior (residual formulation)
-                eps = torch.randn_like(mu_q)
-                y = mu_q + sigma_q * eps
-
-                # Accumulate KL-balanced divergence (sum over T, mean over batch)
-                kl = self._kl_balanced(mu_q, sigma_q, mu_p, sigma_p)  # [B, T]
-                kl_total = kl_total + kl.mean()
-            else:
-                # Inference: sample from prior
-                eps = torch.randn_like(mu_p)
-                y = mu_p + sigma_p * eps
-
-            # z update: deterministic, uses the newly sampled y
+        # ------------------------------------------------------------------
+        # Final outer step WITH gradients — loss and KL live here
+        # ------------------------------------------------------------------
+        for _ in range(K):
             z = self.block(z + y, memory=obs_tokens, freqs_cis=self.freqs_cis)
 
-        return y, z, kl_total
+        u_prior = self.block(y + z, memory=obs_tokens, freqs_cis=self.freqs_cis)
+        mu_p = self.linear_mu_prior(u_prior)
+        sigma_p = F.softplus(self.linear_sigma_prior(u_prior)) + self.sigma_min
+
+        if a_gt_emb is not None:
+            u_post = self.block(
+                y + z + a_gt_emb, memory=obs_tokens, freqs_cis=self.freqs_cis)
+            mu_q = self.linear_mu_post(u_post)
+            sigma_q = F.softplus(self.linear_sigma_post(u_post)) + self.sigma_min
+            eps = torch.randn_like(mu_q)
+            y = u_post + sigma_q * eps   # residual: block output + scaled noise
+
+            # KL only at the final step — truncated ELBO
+            kl = self._kl_balanced(mu_q, sigma_q, mu_p, sigma_p).mean()
+        else:
+            eps = torch.randn_like(mu_p)
+            y = u_prior + sigma_p * eps
+            kl = torch.tensor(0.0, device=obs_tokens.device)
+
+        return y, z, kl
 
     # ========= inference =========
 
@@ -340,7 +369,7 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
         # Fixed supervision steps — no halting (removed in v3 per GRAM paper)
         for _ in range(self.inference_n_sup):
             y, z, _ = self.latent_recursion(
-                obs_tokens, y, z, self.n_recursion, a_gt_emb=None)
+                obs_tokens, y, z, self.n_recursion, self.k_recursion, a_gt_emb=None)
 
         naction_pred = self.output_head(y)
         action_pred = self.normalizer['action'].unnormalize(naction_pred)
@@ -381,7 +410,7 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
 
         for _ in range(self.inference_n_sup):
             y, z, _ = self.latent_recursion(
-                obs_tokens, y, z, self.n_recursion, a_gt_emb=None)
+                obs_tokens, y, z, self.n_recursion, self.k_recursion, a_gt_emb=None)
 
         naction_pred = self.output_head(y)
         action_pred = self.normalizer['action'].unnormalize(naction_pred)
@@ -465,7 +494,7 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
         for sup_step in range(self.N_sup):
             # Variational recursion — uses posterior at training, prior at inference
             y, z, kl = self.latent_recursion(
-                obs_tokens, y, z, self.n_recursion, a_gt_emb=a_gt_emb)
+                obs_tokens, y, z, self.n_recursion, self.k_recursion, a_gt_emb=a_gt_emb)
 
             action_pred = self.output_head(y)
             l2_loss = F.mse_loss(action_pred, nactions)
