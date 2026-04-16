@@ -90,7 +90,7 @@ training:
   resume: True
   # optimization
   lr_scheduler: cosine
-  lr_warmup_steps: 2000
+  lr_warmup_steps: 500
   num_epochs: 200
   gradient_accumulate_every: 1
   use_ema: True
