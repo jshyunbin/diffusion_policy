@@ -1,26 +1,27 @@
 """
-GRAM-ACT: Generative Recursive reAsoning Model for visuomotor policy learning.
+GRAM-ACT v3: Generative Recursive reAsoning Model for visuomotor policy learning.
 
-Adapts the GRAM architecture (originally for discrete symbolic tasks) to continuous
-action prediction for robot policies. Key components:
+Variational recursive latent reasoning architecture adapted from GRAM for continuous
+action prediction. Key components:
 
-- Observation encoder: robomimic ResNet18 with GroupNorm (reused from ACT)
-- Decoder: 2-layer transformer block (RMSNorm post-norm, SwiGLU, RoPE, causal mask)
-  applied recursively with stochastic guidance
-- Dual latents: y (prediction) and z (reasoning), iteratively refined
-  - z updates see observation context via cross-attention
-  - y updates do NOT see observations (forced to integrate through z)
-- Stochastic guidance: learned-scale Gaussian noise on z transitions
-- Deep supervision: multiple supervision steps with detached latent propagation
-- Q-head: halting head trained with BCE against thresholded loss
-- Optional CVAE encoder for latent initialization (toggleable for ablation)
+- Observation encoder: robomimic ResNet18 with GroupNorm (reused from ACT, unmodified)
+- GRAM decoder: shared 2-layer transformer block (RMSNorm post-norm, SwiGLU, RoPE,
+  bidirectional self-attention) applied recursively
+- Dual latents:
+    y [B, T, D]: stochastic prediction latent — sampled at each recursion step
+    z [B, T, D]: deterministic reasoning latent — updated after y is sampled
+- Variational training: prior p_θ(y) vs posterior q_φ(y|a_gt); only the 2-layer
+  block is shared — the four (μ_p, σ_p, μ_q, σ_q) heads are separate Linear layers
+- KL balancing (Hafner et al. 2020) with α=0.8 prevents posterior collapse
+- Deep supervision: N_sup outer steps each with its own backward pass;
+  latents detached between steps (truncated ELBO, no BPTT across sup steps)
+- Optional CVAE for latent initialization (single flag for ablation)
 
 Reference: GRAM (Generative Recursive reAsoning Models), adapted for continuous
-visuomotor control on Multi-Goal PushT.
+visuomotor control on Multi-Goal PushT (v3 — Q-head removed, KL balancing added).
 """
 
 from typing import Dict, Tuple
-import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -55,22 +56,17 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
             ffn_expansion=4,
             # recursion
             n_recursion=6,
-            T_recursion=3,
             N_sup=16,
-            # stochastic guidance
-            sigma_init=0.1,
-            kl_weight_gram=0.01,
-            # Q-head
-            use_q_head=True,
-            q_loss_weight=0.5,
-            success_threshold=0.05,
-            # CVAE (optional)
+            # variational (GRAM-specific)
+            beta_kl=1.0,
+            kl_balance_alpha=0.8,
+            sigma_min=1e-4,
+            # CVAE (optional — single flag for ablation)
             use_cvae=False,
             latent_dim=32,
             kl_weight=10.0,
             # inference
             inference_n_sup=8,
-            inference_use_q_halting=False,
             ):
         super().__init__()
 
@@ -79,12 +75,7 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
         assert len(action_shape) == 1
         action_dim = action_shape[0]
         obs_shape_meta = shape_meta['obs']
-        obs_config = {
-            'low_dim': [],
-            'rgb': [],
-            'depth': [],
-            'scan': []
-        }
+        obs_config = {'low_dim': [], 'rgb': [], 'depth': [], 'scan': []}
         obs_key_shapes = dict()
         for key, attr in obs_shape_meta.items():
             shape = attr['shape']
@@ -156,28 +147,29 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
         # ========= Obs projection =========
         self.obs_proj = nn.Linear(obs_feature_dim, hidden_dim, bias=False)
 
-        # ========= GRAM recursive decoder block =========
+        # ========= GRAM recursive decoder block (SHARED — single instance) =========
         self.block = GRAMBlock(
             dim=hidden_dim, n_heads=n_heads,
             n_layers=n_decoder_layers, ffn_expansion=ffn_expansion)
 
-        # Precompute RoPE frequencies and causal mask (registered as buffers)
+        # Precompute RoPE frequencies (no causal mask in v3 — bidirectional self-attn)
         head_dim = hidden_dim // n_heads
         freqs_cis = precompute_freqs_cis(head_dim, max_seq_len=horizon)
         self.register_buffer('freqs_cis', freqs_cis)
 
-        causal_mask = torch.full((horizon, horizon), float('-inf'))
-        causal_mask = torch.triu(causal_mask, diagonal=1)
-        self.register_buffer('causal_mask', causal_mask)
+        # ========= Variational heads (4 separate — only the block is shared) =========
+        # Prior: predicts (μ_p, σ_p) without ground truth
+        self.linear_mu_prior = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.linear_sigma_prior = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        # Posterior: predicts (μ_q, σ_q) conditioned on ground truth action embedding
+        self.linear_mu_post = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.linear_sigma_post = nn.Linear(hidden_dim, hidden_dim, bias=False)
 
-        # Learned noise scale for stochastic guidance (parameterized as log_sigma)
-        self.log_sigma = nn.Parameter(torch.tensor(math.log(sigma_init)))
+        # Action embedding: projects ground truth actions to hidden_dim for posterior
+        self.action_embedding = nn.Linear(action_dim, hidden_dim, bias=False)
 
         # ========= Output head =========
         self.output_head = nn.Linear(hidden_dim, action_dim, bias=False)
-
-        # ========= Q-head (halting head) =========
-        self.q_head = nn.Linear(hidden_dim, 1, bias=False) if use_q_head else None
 
         # ========= Optional CVAE encoder =========
         if use_cvae:
@@ -193,8 +185,7 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
                 dim_feedforward=4*hidden_dim, dropout=0.0,
                 activation='gelu', batch_first=True,
                 norm_first=True)
-            self.cvae_encoder = nn.TransformerEncoder(
-                encoder_layer, num_layers=2)
+            self.cvae_encoder = nn.TransformerEncoder(encoder_layer, num_layers=2)
             self.latent_proj = nn.Linear(hidden_dim, latent_dim * 2)
             self.latent_out_proj = nn.Linear(latent_dim, hidden_dim)
 
@@ -208,17 +199,14 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
         self.n_action_steps = n_action_steps
         self.n_obs_steps = n_obs_steps
         self.n_recursion = n_recursion
-        self.T_recursion = T_recursion
         self.N_sup = N_sup
-        self.kl_weight_gram = kl_weight_gram
-        self.use_q_head = use_q_head
-        self.q_loss_weight = q_loss_weight
-        self.success_threshold = success_threshold
+        self.beta_kl = beta_kl
+        self.kl_balance_alpha = kl_balance_alpha
+        self.sigma_min = sigma_min
         self.use_cvae = use_cvae
         self.latent_dim = latent_dim
         self.kl_weight = kl_weight
         self.inference_n_sup = inference_n_sup
-        self.inference_use_q_halting = inference_use_q_halting
 
         # Print parameter count
         n_params = sum(p.numel() for p in self.parameters())
@@ -229,8 +217,7 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
     # ========= helpers =========
 
     def encode_obs(self, nobs, B, To):
-        """Encode observations through robomimic obs encoder.
-        Returns (B, To, obs_feature_dim)."""
+        """Encode observations through robomimic obs encoder → (B, To, obs_feature_dim)."""
         this_nobs = dict_apply(nobs,
             lambda x: x[:, :To, ...].reshape(-1, *x.shape[2:]))
         nobs_features = self.obs_encoder(this_nobs)
@@ -245,8 +232,8 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
         return y, z
 
     def encode_to_latent(self, obs_features, actions):
-        """CVAE encoder: encode actions conditioned on obs into latent.
-        Only used when use_cvae=True. Returns (mu, logvar, z_style)."""
+        """CVAE encoder: encode actions conditioned on obs → (mu, logvar, z_style).
+        Only used when use_cvae=True."""
         B = actions.shape[0]
         action_tokens = self.encoder_action_proj(actions)
         cls = self.cls_token.expand(B, -1, -1)
@@ -263,38 +250,74 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
         z_style = mu + std * eps
         return mu, logvar, z_style
 
+    def _kl_balanced(self, mu_q, sigma_q, mu_p, sigma_p):
+        """KL balancing (Hafner et al. 2020) — trains prior more aggressively.
+
+        Returns [B, T] tensor (sum over hidden dim, not mean, per standard ELBO).
+        alpha=0.8: 80% gradient flows through the prior, 20% through the posterior.
+        This prevents posterior collapse by keeping the prior flexible.
+        """
+        alpha = self.kl_balance_alpha
+
+        def kl_gauss(mu1, sig1, mu2, sig2):
+            # KL(N(mu1,sig1²) || N(mu2,sig2²)), summed over last dim
+            return (torch.log(sig2 / sig1)
+                    + (sig1**2 + (mu1 - mu2)**2) / (2 * sig2**2)
+                    - 0.5).sum(dim=-1)
+
+        # Train prior toward stopgrad(posterior)
+        kl_lhs = kl_gauss(mu_q.detach(), sigma_q.detach(), mu_p, sigma_p)
+        # Train posterior toward stopgrad(prior)
+        kl_rhs = kl_gauss(mu_q, sigma_q, mu_p.detach(), sigma_p.detach())
+        return alpha * kl_lhs + (1 - alpha) * kl_rhs  # [B, T]
+
     # ========= GRAM recursion =========
 
-    def latent_recursion(self, obs_tokens, y, z, n):
-        """Inner GRAM recursion: n steps of z refinement + 1 y update.
+    def latent_recursion(self, obs_tokens, y, z, n, a_gt_emb=None):
+        """GRAM variational recursion: n steps of stochastic y + deterministic z update.
 
-        z updates see obs via cross-attention; y update does NOT (asymmetry
-        is load-bearing — forces y to integrate obs info through z).
+        Prior path (training + inference): block(y+z, obs) → (μ_p, σ_p)
+        Posterior path (training only):    block(y+z+a_gt_emb, obs) → (μ_q, σ_q)
+
+        The 2-layer block is SHARED between prior and posterior (called twice per step
+        at training). The four (μ_p, σ_p, μ_q, σ_q) heads are NOT shared.
+
+        z is updated DETERMINISTICALLY after y is sampled, using the new y.
+        y sees obs only through z (asymmetry: z conditions on obs; y conditions on z).
+
+        Returns: (y, z, kl_total_scalar)
         """
-        sigma = self.log_sigma.exp()
-        for _ in range(n):
-            # z update: conditioned on obs, y, z
-            u = self.block(z + y, memory=obs_tokens,
-                           freqs_cis=self.freqs_cis, causal_mask=self.causal_mask)
-            # Stochastic guidance: residual noise injection
-            eps = sigma * torch.randn_like(u)
-            z = u + eps
-        # y update: conditioned on z and y, NOT obs
-        y = self.block(y + z, memory=None,
-                       freqs_cis=self.freqs_cis, causal_mask=self.causal_mask)
-        return y, z
+        kl_total = torch.tensor(0.0, device=obs_tokens.device)
 
-    def deep_recursion(self, obs_tokens, y, z, n, T):
-        """Deep recursion: T calls to latent_recursion, gradients only on last."""
-        if T > 1:
-            with torch.no_grad():
-                for _ in range(T - 1):
-                    y, z = self.latent_recursion(obs_tokens, y, z, n)
-                y = y.detach()
-                z = z.detach()
-        # Last recursion with gradients
-        y, z = self.latent_recursion(obs_tokens, y, z, n)
-        return y, z
+        for _ in range(n):
+            # Prior: predict (μ_p, σ_p) without ground truth
+            u_prior = self.block(y + z, memory=obs_tokens, freqs_cis=self.freqs_cis)
+            mu_p = self.linear_mu_prior(u_prior)
+            sigma_p = F.softplus(self.linear_sigma_prior(u_prior)) + self.sigma_min
+
+            if a_gt_emb is not None:
+                # Posterior: predict (μ_q, σ_q) conditioned on ground truth embedding
+                u_post = self.block(
+                    y + z + a_gt_emb, memory=obs_tokens, freqs_cis=self.freqs_cis)
+                mu_q = self.linear_mu_post(u_post)
+                sigma_q = F.softplus(self.linear_sigma_post(u_post)) + self.sigma_min
+
+                # Reparameterized sample from posterior (residual formulation)
+                eps = torch.randn_like(mu_q)
+                y = mu_q + sigma_q * eps
+
+                # Accumulate KL-balanced divergence (sum over T, mean over batch)
+                kl = self._kl_balanced(mu_q, sigma_q, mu_p, sigma_p)  # [B, T]
+                kl_total = kl_total + kl.mean()
+            else:
+                # Inference: sample from prior
+                eps = torch.randn_like(mu_p)
+                y = mu_p + sigma_p * eps
+
+            # z update: deterministic, uses the newly sampled y
+            z = self.block(z + y, memory=obs_tokens, freqs_cis=self.freqs_cis)
+
+        return y, z, kl_total
 
     # ========= inference =========
 
@@ -307,32 +330,25 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
         obs_features = self.encode_obs(nobs, B, To)
         obs_tokens = self.obs_proj(obs_features)
 
-        # Initialize latents
+        # Initialize latents (truncated normal, or CVAE prior if use_cvae)
         y, z = self.init_latents(B, self.horizon, device)
         if self.use_cvae:
             z_style = torch.randn(B, self.latent_dim, device=device)
             y = self.latent_out_proj(z_style).unsqueeze(1).expand(
                 B, self.horizon, -1).clone()
 
-        # Supervision loop (no loss, inference only)
-        for step in range(self.inference_n_sup):
-            y, z = self.deep_recursion(obs_tokens, y, z,
-                                       self.n_recursion, self.T_recursion)
-            # Optional Q-halting
-            if self.inference_use_q_halting and self.q_head is not None and step >= 1:
-                q_logit = self.q_head(y.mean(dim=1))
-                if torch.sigmoid(q_logit).mean() > 0.5:
-                    break
+        # Fixed supervision steps — no halting (removed in v3 per GRAM paper)
+        for _ in range(self.inference_n_sup):
+            y, z, _ = self.latent_recursion(
+                obs_tokens, y, z, self.n_recursion, a_gt_emb=None)
 
         naction_pred = self.output_head(y)
         action_pred = self.normalizer['action'].unnormalize(naction_pred)
 
         start = To - 1
         end = start + self.n_action_steps
-        action = action_pred[:, start:end]
-
         return {
-            'action': action,
+            'action': action_pred[:, start:end],
             'action_pred': action_pred,
         }
 
@@ -340,39 +356,42 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
         self, obs_dict: Dict[str, torch.Tensor], n_samples: int = 16
     ) -> torch.Tensor:
         """Draw n_samples diverse action chunks via different noise sequences.
-        Returns: (n_samples, B, n_action_steps, action_dim)."""
+
+        Implemented via batch tiling (more efficient than a Python loop):
+        obs is tiled to [n_samples*B, ...], inference runs once, then reshaped.
+
+        Returns: (n_samples, B, n_action_steps, action_dim)
+        """
         nobs = self.normalizer.normalize(obs_dict)
         B = next(iter(nobs.values())).shape[0]
         To = self.n_obs_steps
         device = self.device
+        NB = n_samples * B
 
-        # Encode obs once (shared across all samples)
-        obs_features = self.encode_obs(nobs, B, To)
+        # Tile: each batch element repeated n_samples times
+        tiled_nobs = dict_apply(nobs, lambda x: x.repeat_interleave(n_samples, dim=0))
+        obs_features = self.encode_obs(tiled_nobs, NB, To)
         obs_tokens = self.obs_proj(obs_features)
 
-        all_actions = []
-        for _ in range(n_samples):
-            y, z = self.init_latents(B, self.horizon, device)
-            if self.use_cvae:
-                z_style = torch.randn(B, self.latent_dim, device=device)
-                y = self.latent_out_proj(z_style).unsqueeze(1).expand(
-                    B, self.horizon, -1).clone()
+        y, z = self.init_latents(NB, self.horizon, device)
+        if self.use_cvae:
+            z_style = torch.randn(NB, self.latent_dim, device=device)
+            y = self.latent_out_proj(z_style).unsqueeze(1).expand(
+                NB, self.horizon, -1).clone()
 
-            for step in range(self.inference_n_sup):
-                y, z = self.deep_recursion(obs_tokens, y, z,
-                                           self.n_recursion, self.T_recursion)
-                if self.inference_use_q_halting and self.q_head is not None and step >= 1:
-                    q_logit = self.q_head(y.mean(dim=1))
-                    if torch.sigmoid(q_logit).mean() > 0.5:
-                        break
+        for _ in range(self.inference_n_sup):
+            y, z, _ = self.latent_recursion(
+                obs_tokens, y, z, self.n_recursion, a_gt_emb=None)
 
-            naction_pred = self.output_head(y)
-            action_pred = self.normalizer['action'].unnormalize(naction_pred)
-            start = To - 1
-            end = start + self.n_action_steps
-            all_actions.append(action_pred[:, start:end])
+        naction_pred = self.output_head(y)
+        action_pred = self.normalizer['action'].unnormalize(naction_pred)
+        start = To - 1
+        end = start + self.n_action_steps
+        actions = action_pred[:, start:end]  # [N*B, n_action_steps, action_dim]
 
-        return torch.stack(all_actions, dim=0)
+        # Reshape: repeat_interleave order → [B, n_samples, ...] → [n_samples, B, ...]
+        actions = actions.view(B, n_samples, *actions.shape[1:])
+        return actions.transpose(0, 1).contiguous()
 
     # ========= training =========
 
@@ -409,17 +428,24 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
         """GRAM training with deep supervision.
 
         Runs N_sup supervision steps, each with its own backward pass.
-        Gradients do NOT flow across supervision steps (detached).
-        Returns a float (total loss, already backpropagated).
+        Gradients do NOT flow across supervision steps (latents detached between steps).
+        Posterior is used at training time; prior is used at inference.
+
+        Returns a dict {'loss': float, 'kl_loss': float} for logging.
+        The KL loss monitors posterior collapse — it should be non-zero if training
+        correctly. KL → 0 indicates collapse.
         """
         nobs = self.normalizer.normalize(batch['obs'])
         nactions = self.normalizer['action'].normalize(batch['action'])
         B = nactions.shape[0]
         To = self.n_obs_steps
 
-        # Encode obs (shared, computed once)
+        # Encode obs once (shared across all supervision steps)
         obs_features = self.encode_obs(nobs, B, To)
         obs_tokens = self.obs_proj(obs_features)
+
+        # Ground truth action embedding for posterior conditioning
+        a_gt_emb = self.action_embedding(nactions)  # [B, T_horizon, D]
 
         # Initialize latents
         y, z = self.init_latents(B, self.horizon, nactions.device)
@@ -431,51 +457,38 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
                 obs_features.detach(), nactions)
             y = self.latent_out_proj(z_style).unsqueeze(1).expand(
                 B, self.horizon, -1).clone()
-            cvae_kl = -0.5 * torch.mean(
-                1 + logvar - mu.pow(2) - logvar.exp())
+            cvae_kl = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
 
         total_loss = 0.0
+        total_kl = 0.0
 
         for sup_step in range(self.N_sup):
-            # Deep recursion (gradients only on last inner recursion)
-            y, z = self.deep_recursion(
-                obs_tokens, y, z, self.n_recursion, self.T_recursion)
+            # Variational recursion — uses posterior at training, prior at inference
+            y, z, kl = self.latent_recursion(
+                obs_tokens, y, z, self.n_recursion, a_gt_emb=a_gt_emb)
 
-            # Predict actions
             action_pred = self.output_head(y)
-
-            # L2 action loss
             l2_loss = F.mse_loss(action_pred, nactions)
 
-            # Q-head loss
-            q_loss_val = torch.tensor(0.0, device=nactions.device)
-            if self.use_q_head and self.q_head is not None:
-                q_logit = self.q_head(y.mean(dim=1))
-                per_sample_mse = F.mse_loss(
-                    action_pred, nactions, reduction='none').mean(dim=(1, 2))
-                success_target = (per_sample_mse < self.success_threshold).float()
-                q_loss_val = self.q_loss_weight * F.binary_cross_entropy_with_logits(
-                    q_logit.squeeze(-1), success_target)
+            # ELBO: reconstruction + KL (normalized by N_sup for gradient accumulation)
+            step_loss = (l2_loss + self.beta_kl * kl) / self.N_sup
 
-            # KL regularizer on sigma (recomputed per step for fresh graph)
-            sigma_sq = torch.exp(2 * self.log_sigma)
-            kl_sigma = self.kl_weight_gram * (sigma_sq - 2 * self.log_sigma - 1)
-
-            # Assemble step loss (normalized by N_sup)
-            step_loss = (l2_loss + q_loss_val + kl_sigma) / self.N_sup
-
-            # Add CVAE KL only on first step (graph shared with y init)
+            # CVAE KL added once (on first step — graph shared with y init)
             if self.use_cvae and cvae_kl is not None and sup_step == 0:
-                step_loss = step_loss + self.kl_weight * cvae_kl
+                step_loss = step_loss + self.kl_weight * cvae_kl / self.N_sup
 
-            # Backward only when gradients are enabled (skip during validation)
+            # Backward only when gradients are enabled (skipped during validation)
             if torch.is_grad_enabled():
+                # retain_graph=True for all but the last step — obs_tokens and
+                # a_gt_emb graphs are shared across all N_sup backward passes
                 is_last = (sup_step == self.N_sup - 1)
                 step_loss.backward(retain_graph=not is_last)
-            total_loss += step_loss.item()
 
-            # Detach latents for next supervision step
+            total_loss += step_loss.item()
+            total_kl += kl.item()
+
+            # Detach: no BPTT across supervision steps
             y = y.detach()
             z = z.detach()
 
-        return total_loss
+        return {'loss': total_loss, 'kl_loss': total_kl / self.N_sup}

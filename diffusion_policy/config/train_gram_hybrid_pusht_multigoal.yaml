@@ -37,28 +37,22 @@ policy:
   n_heads: 8
   ffn_expansion: 4
 
-  # Recursion
+  # Recursion (T_recursion removed in v3 — fixed at 1)
   n_recursion: 6
-  T_recursion: 3
   N_sup: 16
 
-  # Stochastic guidance
-  sigma_init: 0.1
-  kl_weight_gram: 0.01
+  # Variational training (GRAM-specific)
+  beta_kl: 1.0            # ELBO weight on KL term
+  kl_balance_alpha: 0.8   # Hafner et al. 2020 KL balancing coefficient
+  sigma_min: 1.0e-4       # numerical floor on σ
 
-  # Q-head
-  use_q_head: true
-  q_loss_weight: 0.5
-  success_threshold: 0.05
-
-  # CVAE (optional — set true for ACT-style initialization)
+  # CVAE (optional — set true for ACT-style initialization ablation)
   use_cvae: false
   latent_dim: 32
   kl_weight: 10.0
 
   # Inference
   inference_n_sup: 8
-  inference_use_q_halting: false
 
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
@@ -66,7 +60,7 @@ ema:
   inv_gamma: 1.0
   power: 0.75
   min_value: 0.0
-  max_value: 0.999
+  max_value: 0.9999
 
 dataloader:
   batch_size: 64

@@ -157,7 +157,15 @@ class TrainGRAMHybridWorkspace(BaseWorkspace):
                             train_sampling_batch = batch
 
                         # compute loss
-                        raw_loss = self.model.compute_loss(batch)
+                        loss_output = self.model.compute_loss(batch)
+                        # Support dict output (GRAM: {'loss': float, 'kl_loss': float})
+                        # and plain float/tensor output (other policies).
+                        if isinstance(loss_output, dict):
+                            raw_loss = loss_output['loss']
+                            aux_metrics = {k: v for k, v in loss_output.items() if k != 'loss'}
+                        else:
+                            raw_loss = loss_output
+                            aux_metrics = {}
                         # GRAM does backward internally (returns float);
                         # other policies return a tensor needing backward.
                         if isinstance(raw_loss, torch.Tensor) and raw_loss.requires_grad:
@@ -186,7 +194,8 @@ class TrainGRAMHybridWorkspace(BaseWorkspace):
                             'train_loss': raw_loss_cpu,
                             'global_step': self.global_step,
                             'epoch': self.epoch,
-                            'lr': lr_scheduler.get_last_lr()[0]
+                            'lr': lr_scheduler.get_last_lr()[0],
+                            **{f'train_{k}': v for k, v in aux_metrics.items()},
                         }
 
                         is_last_batch = (batch_idx == (len(train_dataloader)-1))
@@ -222,13 +231,15 @@ class TrainGRAMHybridWorkspace(BaseWorkspace):
                                 leave=False, mininterval=cfg.training.tqdm_interval_sec) as tepoch:
                             for batch_idx, batch in enumerate(tepoch):
                                 batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
-                                loss = self.model.compute_loss(batch)
-                                val_losses.append(loss)
+                                loss_output = self.model.compute_loss(batch)
+                                loss_val = loss_output['loss'] if isinstance(loss_output, dict) else (
+                                    loss_output if isinstance(loss_output, float) else loss_output.item())
+                                val_losses.append(loss_val)
                                 if (cfg.training.max_val_steps is not None) \
                                     and batch_idx >= (cfg.training.max_val_steps-1):
                                     break
                         if len(val_losses) > 0:
-                            val_loss = torch.mean(torch.tensor(val_losses)).item()
+                            val_loss = float(np.mean(val_losses))
                             step_log['val_loss'] = val_loss
 
                 # run action prediction on a training batch
