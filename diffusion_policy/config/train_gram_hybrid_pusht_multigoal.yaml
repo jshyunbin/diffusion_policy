@@ -45,7 +45,7 @@ policy:
   # Variational training (GRAM-specific)
   beta_kl: 1.0            # ELBO weight on KL term
   kl_balance_alpha: 0.8   # Hafner et al. 2020 KL balancing coefficient
-  sigma_min: 1.0e-4       # numerical floor on σ
+  sigma_min: 0.0       # numerical floor on σ
 
   # CVAE (optional — set true for ACT-style initialization ablation)
   use_cvae: false
@@ -53,7 +53,7 @@ policy:
   kl_weight: 10.0
 
   # Inference
-  inference_n_sup: 16
+  inference_n_sup: 64
 
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
