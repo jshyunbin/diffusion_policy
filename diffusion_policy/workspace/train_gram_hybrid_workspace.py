@@ -156,6 +156,13 @@ class TrainGRAMHybridWorkspace(BaseWorkspace):
                         if train_sampling_batch is None:
                             train_sampling_batch = batch
 
+                        # KL annealing: ramp current_beta_kl from 0 → beta_kl
+                        if getattr(self.model, 'kl_anneal_steps', 0) > 0:
+                            anneal = min(1.0, self.global_step / self.model.kl_anneal_steps)
+                            self.model.current_beta_kl = anneal * self.model.beta_kl
+                            if self.ema_model is not None:
+                                self.ema_model.current_beta_kl = self.model.current_beta_kl
+
                         # compute loss
                         loss_output = self.model.compute_loss(batch)
                         # Support dict output (GRAM: {'loss': float, 'kl_loss': float})
@@ -195,6 +202,7 @@ class TrainGRAMHybridWorkspace(BaseWorkspace):
                             'global_step': self.global_step,
                             'epoch': self.epoch,
                             'lr': lr_scheduler.get_last_lr()[0],
+                            'beta_kl': getattr(self.model, 'current_beta_kl', None),
                             **{f'train_{k}': v for k, v in aux_metrics.items()},
                         }
 

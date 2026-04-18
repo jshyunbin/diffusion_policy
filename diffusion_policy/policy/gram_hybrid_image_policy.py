@@ -63,6 +63,7 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
             N_sup=16,
             # variational (GRAM-specific)
             beta_kl=1.0,
+            kl_anneal_steps=0,
             kl_balance_alpha=0.8,
             sigma_min=1e-4,
             # CVAE (optional — single flag for ablation)
@@ -216,6 +217,10 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
         self.k_recursion = k_recursion
         self.N_sup = N_sup
         self.beta_kl = beta_kl
+        self.kl_anneal_steps = kl_anneal_steps
+        # current_beta_kl is updated by the workspace each step during annealing;
+        # starts at 0 if annealing is enabled, else fixed at beta_kl
+        self.current_beta_kl = 0.0 if kl_anneal_steps > 0 else beta_kl
         self.kl_balance_alpha = kl_balance_alpha
         self.sigma_min = sigma_min
         self.use_cvae = use_cvae
@@ -503,7 +508,7 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
             l2_loss = F.mse_loss(action_pred, nactions)
 
             # ELBO: reconstruction + KL (normalized by N_sup for gradient accumulation)
-            step_loss = (l2_loss + self.beta_kl * kl) / self.N_sup
+            step_loss = (l2_loss + self.current_beta_kl * kl) / self.N_sup
 
             # CVAE KL added once (on first step — graph shared with y init)
             if self.use_cvae and cvae_kl is not None and sup_step == 0:
