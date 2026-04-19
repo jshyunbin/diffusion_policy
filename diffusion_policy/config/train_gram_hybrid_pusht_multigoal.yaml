@@ -43,7 +43,7 @@ policy:
   N_sup: 16
 
   # Variational training (GRAM-specific)
-  beta_kl: 0.01           # ELBO weight on KL term
+  beta_kl: 0.1            # ELBO weight on KL term
   kl_anneal_steps: 2000   # ramp beta_kl from 0 → beta_kl over this many steps (0=disabled)
   kl_balance_alpha: 0.8   # Hafner et al. 2020 KL balancing coefficient
   sigma_min: 1.0e-4       # numerical floor on σ
@@ -54,7 +54,7 @@ policy:
   kl_weight: 10.0
 
   # Inference
-  inference_n_sup: 16
+  inference_n_sup: 32
 
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
@@ -92,7 +92,7 @@ training:
   # optimization
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 200
+  num_epochs: 1000
   gradient_accumulate_every: 1
   use_ema: True
   grad_clip: 1.0
