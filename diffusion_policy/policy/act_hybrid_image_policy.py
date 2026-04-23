@@ -121,7 +121,6 @@ class ACTHybridImagePolicy(BaseImagePolicy):
         self.cls_token = nn.Parameter(torch.zeros(1, 1, n_emb))
         nn.init.normal_(self.cls_token, std=0.02)
         self.encoder_action_proj = nn.Linear(action_dim, n_emb)
-        self.encoder_obs_proj = nn.Linear(obs_feature_dim, n_emb)
         # positional embedding for encoder: [CLS] + horizon action tokens
         self.encoder_pos_embed = nn.Parameter(
             torch.zeros(1, 1 + horizon, n_emb))
@@ -172,31 +171,23 @@ class ACTHybridImagePolicy(BaseImagePolicy):
         nobs_features = self.obs_encoder(this_nobs)
         return nobs_features.reshape(B, To, -1)
 
-    def encode_to_latent(self, obs_features, actions):
-        """CVAE encoder: encode actions conditioned on obs into latent z.
-        Returns (mu, logvar, z) each of shape (B, latent_dim)."""
+    def encode_to_latent(self, actions):
+        """CVAE encoder: encode action sequence into latent z.
+
+        Follows ACT exactly: TransformerEncoder on [CLS, action_tokens].
+        No observations — z captures action style only.
+        Returns (mu, logvar, z) each of shape (B, latent_dim).
+        """
         B = actions.shape[0]
-        # project actions: (B, T, Da) -> (B, T, n_emb)
         action_tokens = self.encoder_action_proj(actions)
-        # CLS token
         cls = self.cls_token.expand(B, -1, -1)
-        # encoder input: [CLS, action_1, ..., action_T]
         encoder_input = torch.cat([cls, action_tokens], dim=1)
         encoder_input = encoder_input + self.encoder_pos_embed
-        # obs features as additional context via cross-attention
-        # For simplicity, concatenate obs conditioning:
-        # We use the mean obs feature as additive bias to CLS
-        obs_cond = self.encoder_obs_proj(obs_features.mean(dim=1, keepdim=True))
-        encoder_input[:, :1] = encoder_input[:, :1] + obs_cond
-
         encoder_output = self.encoder(encoder_input)
-        cls_output = encoder_output[:, 0]  # (B, n_emb)
-        latent_params = self.latent_proj(cls_output)  # (B, latent_dim*2)
-        mu, logvar = latent_params.chunk(2, dim=-1)
-        # reparameterization
+        cls_output = encoder_output[:, 0]
+        mu, logvar = self.latent_proj(cls_output).chunk(2, dim=-1)
         std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        z = mu + std * eps
+        z = mu + std * torch.randn_like(std)
         return mu, logvar, z
 
     def decode_actions(self, obs_features, z):
@@ -287,8 +278,8 @@ class ACTHybridImagePolicy(BaseImagePolicy):
         # encode observations
         obs_features = self.encode_obs(nobs, B, To)
 
-        # CVAE encode: get latent from actions
-        mu, logvar, z = self.encode_to_latent(obs_features.detach(), nactions)
+        # CVAE encode: get latent from actions only
+        mu, logvar, z = self.encode_to_latent(nactions)
 
         # decode actions
         pred_actions = self.decode_actions(obs_features, z)
