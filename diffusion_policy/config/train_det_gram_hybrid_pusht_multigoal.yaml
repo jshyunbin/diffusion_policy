@@ -42,6 +42,12 @@ policy:
   k_recursion: 4    # deterministic z-updates per outer step (inner loop)
   N_sup: 16
 
+  # CVAE encoder (ACT-style latent initialization)
+  latent_dim: 32
+  kl_weight: 10.0
+  n_encoder_layers: 2
+  encoder_dropout: 0.1
+
   # Inference
   inference_n_sup: 32
 
