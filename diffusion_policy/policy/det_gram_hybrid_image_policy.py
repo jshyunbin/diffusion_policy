@@ -1,15 +1,20 @@
 """
-DET-GRAM: Deterministic GRAM-ACT with ACT-style CVAE latent initialization.
+DET-GRAM: Deterministic GRAM-ACT with ACT-style CVAE latent conditioning.
 
 Removes all within-recursion stochasticity (prior/posterior heads, KL balancing,
-sigma sampling). Instead, a CVAE encoder (identical to ACT) provides a single
-stochastic latent z that initializes y before the recursive loop:
+sigma sampling). Instead, a CVAE encoder (faithful to ACT) produces a single
+stochastic latent z that is injected into the GRAM decoder as an additional
+memory token:
 
-  Training: z ~ q(z | a_gt, obs)  via TransformerEncoder on [CLS, action_tokens]
-  Inference: z = 0  (prior mean of N(0, I))
+  CVAE encoder input:  [CLS, action_tokens]  — actions only, no obs
+  z injection:         memory = cat([z_token, obs_tokens], dim=1)
+                       → passed as cross-attention memory to the GRAM block
+
+  Training: z ~ q(z | a_gt)  via TransformerEncoder on [CLS, action_tokens]
+  Inference: z = 0            (prior mean of N(0, I))
 
 The recursive structure (K inner z-loop, n outer steps, N_sup deep supervision,
-truncated warm-up) is preserved unchanged. y update: y = block(y+z, obs).
+truncated warm-up) is preserved unchanged. y update: y = block(y+z_gram, memory).
 
 Loss = MSE + kl_weight * KL(q || N(0,I))
 """
@@ -148,7 +153,7 @@ class DETGRAMHybridImagePolicy(BaseImagePolicy):
         freqs_cis = precompute_freqs_cis(head_dim, max_seq_len=horizon)
         self.register_buffer('freqs_cis', freqs_cis)
 
-        # ========= Fixed initial latent states (buffers, not trained) =========
+        # ========= Fixed initial GRAM latent states (buffers, not trained) =========
         y_init = torch.empty(1, horizon, hidden_dim)
         z_init = torch.empty(1, horizon, hidden_dim)
         nn.init.trunc_normal_(y_init, std=1.0, a=-2.0, b=2.0)
@@ -156,23 +161,25 @@ class DETGRAMHybridImagePolicy(BaseImagePolicy):
         self.register_buffer('y_init', y_init)
         self.register_buffer('z_init', z_init)
 
-        # ========= CVAE encoder (ACT-style) =========
-        # Encodes ground truth actions into a latent z that initializes y.
-        # At inference z=0 (prior mean); at training z ~ q(z|a_gt, obs).
-        self.cls_token = nn.Parameter(torch.zeros(1, 1, hidden_dim))
-        nn.init.normal_(self.cls_token, std=0.02)
+        # ========= CVAE encoder (ACT-style, actions only) =========
+        # Encodes ground truth action sequence into latent z.
+        # Input: [CLS, action_tokens] — no obs, no cross-attention.
+        # z is projected to hidden_dim and prepended to obs_tokens as a memory
+        # token for the GRAM block cross-attention.
+        self.cls_embed = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+        nn.init.normal_(self.cls_embed, std=0.02)
         self.encoder_action_proj = nn.Linear(action_dim, hidden_dim)
-        self.encoder_obs_proj = nn.Linear(obs_feature_dim, hidden_dim)
+        # positional embedding for [CLS, a_1, ..., a_T]
         self.encoder_pos_embed = nn.Parameter(
             torch.zeros(1, 1 + horizon, hidden_dim))
         nn.init.normal_(self.encoder_pos_embed, std=0.02)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim, nhead=n_heads,
             dim_feedforward=4 * hidden_dim, dropout=encoder_dropout,
-            activation='gelu', batch_first=True, norm_first=True)
+            activation='relu', batch_first=True, norm_first=False)
         self.cvae_encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_encoder_layers)
         self.latent_proj = nn.Linear(hidden_dim, latent_dim * 2)   # → (mu, logvar)
-        self.latent_out_proj = nn.Linear(latent_dim, hidden_dim)   # z → y_init offset
+        self.latent_out_proj = nn.Linear(latent_dim, hidden_dim)   # z → memory token
 
         # ========= Output head =========
         self.output_head = nn.Linear(hidden_dim, action_dim, bias=False)
@@ -208,54 +215,61 @@ class DETGRAMHybridImagePolicy(BaseImagePolicy):
         return nobs_features.reshape(B, To, -1)
 
     def init_latents(self, B):
-        """Return fixed initial latents expanded to batch size B."""
+        """Return fixed initial GRAM latents expanded to batch size B."""
         return self.y_init.expand(B, -1, -1), self.z_init.expand(B, -1, -1)
 
-    def encode_to_latent(self, obs_features, actions):
-        """CVAE encoder: encode actions conditioned on obs → (mu, logvar, z).
+    def encode_to_latent(self, actions):
+        """CVAE encoder: encode action sequence → (mu, logvar, z).
 
-        Identical to ACT: a TransformerEncoder on [CLS, action_tokens] with obs
-        mean added to the CLS token as conditioning context.
+        Follows ACT exactly: TransformerEncoder on [CLS, action_tokens].
+        No observations are used — z captures action style only.
 
         Returns mu, logvar, z each of shape (B, latent_dim).
         """
         B = actions.shape[0]
-        action_tokens = self.encoder_action_proj(actions)           # (B, T, D)
-        cls = self.cls_token.expand(B, -1, -1)                      # (B, 1, D)
-        encoder_input = torch.cat([cls, action_tokens], dim=1)      # (B, 1+T, D)
+        action_tokens = self.encoder_action_proj(actions)               # (B, T, D)
+        cls = self.cls_embed.expand(B, -1, -1)                          # (B, 1, D)
+        encoder_input = torch.cat([cls, action_tokens], dim=1)          # (B, 1+T, D)
         encoder_input = encoder_input + self.encoder_pos_embed
-        obs_cond = self.encoder_obs_proj(obs_features.mean(dim=1, keepdim=True))
-        encoder_input[:, :1] = encoder_input[:, :1] + obs_cond
         encoder_output = self.cvae_encoder(encoder_input)
-        cls_output = encoder_output[:, 0]                           # (B, D)
-        mu, logvar = self.latent_proj(cls_output).chunk(2, dim=-1)  # (B, latent_dim)
+        cls_output = encoder_output[:, 0]                               # (B, D)
+        mu, logvar = self.latent_proj(cls_output).chunk(2, dim=-1)      # (B, latent_dim)
         std = torch.exp(0.5 * logvar)
         z = mu + std * torch.randn_like(std)
         return mu, logvar, z
 
+    def build_memory(self, obs_tokens, z):
+        """Prepend z_token to obs_tokens to form GRAM cross-attention memory.
+
+        memory = [z_token, obs_1, ..., obs_To]  shape: (B, 1+To, D)
+        """
+        z_token = self.latent_out_proj(z).unsqueeze(1)  # (B, 1, D)
+        return torch.cat([z_token, obs_tokens], dim=1)  # (B, 1+To, D)
+
     # ========= GRAM recursion (deterministic) =========
 
-    def latent_recursion(self, obs_tokens, y, z, n, K):
-        """Deterministic GRAM recursion: y = block(y + z, obs), no sampling.
+    def latent_recursion(self, memory, y, z_gram, n, K):
+        """Deterministic GRAM recursion with cross-attention over memory.
 
+        memory = [z_token, obs_tokens] — built once before the supervision loop.
         Truncated warm-up: first n-1 outer steps under torch.no_grad();
         final outer step runs with gradients. Structure per outer step:
-          K deterministic z-updates: z = block(z + y, obs)
-          1 deterministic y-update:  y = block(y + z, obs)
+          K z_gram updates: z_gram = block(z_gram + y, memory=memory)
+          1 y update:       y      = block(y + z_gram, memory=memory)
 
-        Returns: (y, z)
+        Returns: (y, z_gram)
         """
         with torch.no_grad():
             for _ in range(n - 1):
                 for _ in range(K):
-                    z = self.block(z + y, memory=obs_tokens, freqs_cis=self.freqs_cis)
-                y = self.block(y + z, memory=obs_tokens, freqs_cis=self.freqs_cis)
+                    z_gram = self.block(z_gram + y, memory=memory, freqs_cis=self.freqs_cis)
+                y = self.block(y + z_gram, memory=memory, freqs_cis=self.freqs_cis)
 
         for _ in range(K):
-            z = self.block(z + y, memory=obs_tokens, freqs_cis=self.freqs_cis)
-        y = self.block(y + z, memory=obs_tokens, freqs_cis=self.freqs_cis)
+            z_gram = self.block(z_gram + y, memory=memory, freqs_cis=self.freqs_cis)
+        y = self.block(y + z_gram, memory=memory, freqs_cis=self.freqs_cis)
 
-        return y, z
+        return y, z_gram
 
     # ========= inference =========
 
@@ -267,15 +281,14 @@ class DETGRAMHybridImagePolicy(BaseImagePolicy):
         obs_features = self.encode_obs(nobs, B, To)
         obs_tokens = self.obs_proj(obs_features)
 
-        # Prior: z = 0 (mean of N(0,I)), projected to y initialization
+        # Prior: z = 0 (mean of N(0,I))
         z_prior = torch.zeros(B, self.latent_dim, device=self.device, dtype=obs_tokens.dtype)
-        y_offset = self.latent_out_proj(z_prior).unsqueeze(1)   # (B, 1, D)
-        y_base, z = self.init_latents(B)
-        y = (y_base + y_offset).clone()
+        memory = self.build_memory(obs_tokens, z_prior)
 
+        y, z_gram = self.init_latents(B)
         for _ in range(self.inference_n_sup):
-            y, z = self.latent_recursion(
-                obs_tokens, y, z, self.n_recursion, self.k_recursion)
+            y, z_gram = self.latent_recursion(
+                memory, y, z_gram, self.n_recursion, self.k_recursion)
 
         naction_pred = self.output_head(y)
         action_pred = self.normalizer['action'].unnormalize(naction_pred)
@@ -319,11 +332,13 @@ class DETGRAMHybridImagePolicy(BaseImagePolicy):
         return torch.optim.AdamW(optim_groups, lr=learning_rate, betas=betas)
 
     def compute_loss(self, batch):
-        """DET-GRAM training with CVAE initialization and deep supervision.
+        """DET-GRAM training with CVAE z-token memory conditioning and deep supervision.
 
-        CVAE encodes ground truth actions → z ~ q(z|a_gt, obs), which is
-        projected and added to y_init before the recursive loop.
-        KL(q || N(0,I)) is added once to the first supervision step.
+        CVAE encodes ground truth actions → z ~ q(z|a_gt). The latent is projected
+        to a single token and prepended to obs_tokens as the GRAM block's memory:
+          memory = [z_token, obs_1, ..., obs_To]
+
+        KL(q || N(0,I)) is added once (on the first supervision step).
 
         Returns a dict {'loss': float, 'mse_loss': float, 'kl_loss': float}.
         """
@@ -335,27 +350,26 @@ class DETGRAMHybridImagePolicy(BaseImagePolicy):
         obs_features = self.encode_obs(nobs, B, To)
         obs_tokens = self.obs_proj(obs_features)
 
-        # CVAE: encode actions → z, initialize y with z projection
-        mu, logvar, z_latent = self.encode_to_latent(obs_features.detach(), nactions)
-        y_offset = self.latent_out_proj(z_latent).unsqueeze(1)   # (B, 1, D)
-        y_base, z = self.init_latents(B)
-        y = (y_base + y_offset).clone()
+        # CVAE: encode actions → z, build memory with z_token prepended
+        mu, logvar, z_latent = self.encode_to_latent(nactions)
+        memory = self.build_memory(obs_tokens, z_latent)
 
-        # KL(q(z|a,o) || N(0,I)) — computed once, added to first step loss
+        # KL(q(z|a) || N(0,I))
         kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
 
+        y, z_gram = self.init_latents(B)
         total_loss = 0.0
         total_mse = 0.0
 
         for sup_step in range(self.N_sup):
-            y, z = self.latent_recursion(
-                obs_tokens, y, z, self.n_recursion, self.k_recursion)
+            y, z_gram = self.latent_recursion(
+                memory, y, z_gram, self.n_recursion, self.k_recursion)
 
             action_pred = self.output_head(y)
             mse = F.mse_loss(action_pred, nactions)
             step_loss = mse / self.N_sup
 
-            # Add KL on the first step (graph is alive; y_offset shares the graph)
+            # KL added once on the first step while the memory graph is alive
             if sup_step == 0:
                 step_loss = step_loss + self.kl_weight * kl_loss / self.N_sup
 
@@ -367,7 +381,7 @@ class DETGRAMHybridImagePolicy(BaseImagePolicy):
             total_mse += mse.item()
 
             y = y.detach()
-            z = z.detach()
+            z_gram = z_gram.detach()
 
         return {
             'loss': total_loss,
