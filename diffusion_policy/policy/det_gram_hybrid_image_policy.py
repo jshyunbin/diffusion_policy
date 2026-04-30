@@ -161,6 +161,12 @@ class DETGRAMHybridImagePolicy(BaseImagePolicy):
         self.register_buffer('y_init', y_init)
         self.register_buffer('z_init', z_init)
 
+        # ========= Learned positional embedding for cross-attention memory =========
+        # memory layout: [z_token (1), obs_tokens (n_obs_steps)]
+        mem_len = 1 + n_obs_steps
+        self.mem_pos_embed = nn.Parameter(torch.zeros(1, mem_len, hidden_dim))
+        nn.init.normal_(self.mem_pos_embed, std=0.02)
+
         # ========= CVAE encoder (ACT-style, actions only) =========
         # Encodes ground truth action sequence into latent z.
         # Input: [CLS, action_tokens] — no obs, no cross-attention.
@@ -242,9 +248,11 @@ class DETGRAMHybridImagePolicy(BaseImagePolicy):
         """Prepend z_token to obs_tokens to form GRAM cross-attention memory.
 
         memory = [z_token, obs_1, ..., obs_To]  shape: (B, 1+To, D)
+        Learned positional embeddings are added before cross-attention.
         """
         z_token = self.latent_out_proj(z).unsqueeze(1)  # (B, 1, D)
-        return torch.cat([z_token, obs_tokens], dim=1)  # (B, 1+To, D)
+        memory = torch.cat([z_token, obs_tokens], dim=1)  # (B, 1+To, D)
+        return memory + self.mem_pos_embed
 
     # ========= GRAM recursion (deterministic) =========
 

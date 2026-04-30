@@ -164,6 +164,10 @@ class TRMHybridImagePolicy(BaseImagePolicy):
         obs_mask[:, :, :, horizon + 1:] = float('-inf')
         self.register_buffer('obs_mask', obs_mask)
 
+        # ========= Learned positional embedding for cross-attention memory =========
+        self.mem_pos_embed = nn.Parameter(torch.zeros(1, mem_len, hidden_dim))
+        nn.init.normal_(self.mem_pos_embed, std=0.02)
+
         # ========= CVAE encoder (same as DET-GRAM, actions only) =========
         self.cls_embed = nn.Parameter(torch.zeros(1, 1, hidden_dim))
         nn.init.normal_(self.cls_embed, std=0.02)
@@ -241,14 +245,14 @@ class TRMHybridImagePolicy(BaseImagePolicy):
         """
         def _step(y, z_gram):
             x = z_gram + y
-            memory = torch.cat([x, z_cvae_token, obs_tokens], dim=1)
+            memory = torch.cat([x, z_cvae_token, obs_tokens], dim=1) + self.mem_pos_embed
 
             # K low-latent updates: no mask
             for _ in range(K):
                 z_gram = self.block(x, memory=memory, freqs_cis=self.freqs_cis,
                                     cross_attn_mask=None)
                 x = z_gram + y
-                memory = torch.cat([x, z_cvae_token, obs_tokens], dim=1)
+                memory = torch.cat([x, z_cvae_token, obs_tokens], dim=1) + self.mem_pos_embed
 
             # 1 high-latent update: obs masked
             y = self.block(x, memory=memory, freqs_cis=self.freqs_cis,
