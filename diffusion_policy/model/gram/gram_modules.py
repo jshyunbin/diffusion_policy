@@ -88,6 +88,7 @@ class GRAMAttention(nn.Module):
         memory: torch.Tensor = None,
         freqs_cis: torch.Tensor = None,
         causal_mask: torch.Tensor = None,
+        cross_attn_mask: torch.Tensor = None,
     ) -> torch.Tensor:
         B, T, D = x.shape
         is_cross = memory is not None
@@ -108,6 +109,10 @@ class GRAMAttention(nn.Module):
         # Causal masking only on self-attention
         if causal_mask is not None and not is_cross:
             attn = attn + causal_mask[:T, :T]
+
+        # Cross-attention masking (e.g. block obs tokens for high-latent update)
+        if cross_attn_mask is not None and is_cross:
+            attn = attn + cross_attn_mask  # broadcasts (1,1,1,Tkv) over (B,n_heads,T,Tkv)
 
         attn = F.softmax(attn, dim=-1)
         out = torch.matmul(attn, v)
@@ -136,10 +141,11 @@ class GRAMTransformerLayer(nn.Module):
         memory: torch.Tensor = None,
         freqs_cis: torch.Tensor = None,
         causal_mask: torch.Tensor = None,
+        cross_attn_mask: torch.Tensor = None,
     ) -> torch.Tensor:
         x = self.norm_sa(x + self.self_attn(x, freqs_cis=freqs_cis, causal_mask=causal_mask))
         if memory is not None:
-            x = self.norm_ca(x + self.cross_attn(x, memory=memory))
+            x = self.norm_ca(x + self.cross_attn(x, memory=memory, cross_attn_mask=cross_attn_mask))
         x = self.norm_ffn(x + self.ffn(x))
         return x
 
@@ -163,7 +169,9 @@ class GRAMBlock(nn.Module):
         memory: torch.Tensor = None,
         freqs_cis: torch.Tensor = None,
         causal_mask: torch.Tensor = None,
+        cross_attn_mask: torch.Tensor = None,
     ) -> torch.Tensor:
         for layer in self.layers:
-            x = layer(x, memory=memory, freqs_cis=freqs_cis, causal_mask=causal_mask)
+            x = layer(x, memory=memory, freqs_cis=freqs_cis, causal_mask=causal_mask,
+                      cross_attn_mask=cross_attn_mask)
         return x
