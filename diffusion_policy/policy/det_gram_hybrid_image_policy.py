@@ -161,11 +161,16 @@ class DETGRAMHybridImagePolicy(BaseImagePolicy):
         self.register_buffer('y_init', y_init)
         self.register_buffer('z_init', z_init)
 
-        # ========= Learned positional embedding for cross-attention memory =========
+        # ========= Learned positional embedding + encoder for cross-attention memory =========
         # memory layout: [z_token (1), obs_tokens (n_obs_steps)]
         mem_len = 1 + n_obs_steps
         self.mem_pos_embed = nn.Parameter(torch.zeros(1, mem_len, hidden_dim))
         nn.init.normal_(self.mem_pos_embed, std=0.02)
+        mem_enc_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, nhead=n_heads,
+            dim_feedforward=4 * hidden_dim, dropout=encoder_dropout,
+            activation='relu', batch_first=True, norm_first=False)
+        self.mem_encoder = nn.TransformerEncoder(mem_enc_layer, num_layers=n_encoder_layers)
 
         # ========= CVAE encoder (ACT-style, actions only) =========
         # Encodes ground truth action sequence into latent z.
@@ -245,14 +250,14 @@ class DETGRAMHybridImagePolicy(BaseImagePolicy):
         return mu, logvar, z
 
     def build_memory(self, obs_tokens, z):
-        """Prepend z_token to obs_tokens to form GRAM cross-attention memory.
+        """Prepend z_token to obs_tokens, add positional embeddings, then encode.
 
-        memory = [z_token, obs_1, ..., obs_To]  shape: (B, 1+To, D)
-        Learned positional embeddings are added before cross-attention.
+        memory = mem_encoder([z_token, obs_1, ..., obs_To] + pos_embed)
+        shape: (B, 1+To, D)
         """
         z_token = self.latent_out_proj(z).unsqueeze(1)  # (B, 1, D)
-        memory = torch.cat([z_token, obs_tokens], dim=1)  # (B, 1+To, D)
-        return memory + self.mem_pos_embed
+        memory = torch.cat([z_token, obs_tokens], dim=1) + self.mem_pos_embed
+        return self.mem_encoder(memory)
 
     # ========= GRAM recursion (deterministic) =========
 

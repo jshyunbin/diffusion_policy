@@ -164,9 +164,16 @@ class TRMHybridImagePolicy(BaseImagePolicy):
         obs_mask[:, :, :, horizon + 1:] = float('-inf')
         self.register_buffer('obs_mask', obs_mask)
 
-        # ========= Learned positional embedding for cross-attention memory =========
-        self.mem_pos_embed = nn.Parameter(torch.zeros(1, mem_len, hidden_dim))
-        nn.init.normal_(self.mem_pos_embed, std=0.02)
+        # ========= Positional embedding + encoder for [z_cvae_token, obs_tokens] context =========
+        # x tokens are not encoded here — they change every step and carry RoPE from self-attn.
+        context_len = 1 + n_obs_steps
+        self.context_pos_embed = nn.Parameter(torch.zeros(1, context_len, hidden_dim))
+        nn.init.normal_(self.context_pos_embed, std=0.02)
+        context_enc_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim, nhead=n_heads,
+            dim_feedforward=4 * hidden_dim, dropout=encoder_dropout,
+            activation='relu', batch_first=True, norm_first=False)
+        self.context_encoder = nn.TransformerEncoder(context_enc_layer, num_layers=n_encoder_layers)
 
         # ========= CVAE encoder (same as DET-GRAM, actions only) =========
         self.cls_embed = nn.Parameter(torch.zeros(1, 1, hidden_dim))
@@ -237,22 +244,27 @@ class TRMHybridImagePolicy(BaseImagePolicy):
     def latent_recursion(self, obs_tokens, z_cvae_token, y, z_gram, n, K):
         """TRM-style latent recursion with masked high-latent update.
 
-        Memory for both updates: [x, z_cvae_token, obs_tokens]
-          - x = z_gram + y  (commutative, same value for both updates)
-        Difference: y update applies obs_mask (blocks last n_obs_steps positions).
+        Context [z_cvae_token, obs_tokens] is encoded once before the loop.
+        Memory per step: [x, encoded_ctx]  where x = z_gram + y.
+        Difference between updates: y update applies obs_mask (blocks encoded_ctx
+        positions horizon+1: so y cannot directly attend to obs-derived tokens).
 
         Truncated warm-up: first n-1 outer steps under no_grad.
         """
+        # Encode context once — fixed for all steps within this call
+        context = torch.cat([z_cvae_token, obs_tokens], dim=1) + self.context_pos_embed
+        encoded_ctx = self.context_encoder(context)  # (B, 1+To, D)
+
         def _step(y, z_gram):
             x = z_gram + y
-            memory = torch.cat([x, z_cvae_token, obs_tokens], dim=1) + self.mem_pos_embed
+            memory = torch.cat([x, encoded_ctx], dim=1)
 
             # K low-latent updates: no mask
             for _ in range(K):
                 z_gram = self.block(x, memory=memory, freqs_cis=self.freqs_cis,
                                     cross_attn_mask=None)
                 x = z_gram + y
-                memory = torch.cat([x, z_cvae_token, obs_tokens], dim=1) + self.mem_pos_embed
+                memory = torch.cat([x, encoded_ctx], dim=1)
 
             # 1 high-latent update: obs masked
             y = self.block(x, memory=memory, freqs_cis=self.freqs_cis,

@@ -144,6 +144,13 @@ class ACTHybridImagePolicy(BaseImagePolicy):
         self.decoder_memory_pos_embed = nn.Parameter(
             torch.zeros(1, 1 + n_obs_steps, n_emb))
         nn.init.normal_(self.decoder_memory_pos_embed, std=0.02)
+        # memory encoder: contextualizes [z_token, obs_tokens] before cross-attention
+        mem_enc_layer = nn.TransformerEncoderLayer(
+            d_model=n_emb, nhead=n_head,
+            dim_feedforward=4*n_emb, dropout=p_drop,
+            activation='gelu', batch_first=True,
+            norm_first=True)
+        self.mem_encoder = nn.TransformerEncoder(mem_enc_layer, num_layers=n_layer)
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=n_emb, nhead=n_head,
             dim_feedforward=4*n_emb, dropout=p_drop,
@@ -201,6 +208,7 @@ class ACTHybridImagePolicy(BaseImagePolicy):
         # decoder memory: [z_token, obs_1, ..., obs_To]
         memory = torch.cat([z_token, obs_tokens], dim=1)
         memory = memory + self.decoder_memory_pos_embed
+        memory = self.mem_encoder(memory)
 
         # action queries: (B, T, n_emb)
         queries = self.action_queries.expand(B, -1, -1)
