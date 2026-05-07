@@ -139,7 +139,7 @@ class ACTHybridImagePolicy(BaseImagePolicy):
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=n_emb, nhead=n_head,
             dim_feedforward=4*n_emb, dropout=p_drop,
-            activation='gelu', batch_first=True, norm_first=True)
+            activation='gelu', batch_first=True, norm_first=False)
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layer)
         self.latent_proj = nn.Linear(n_emb, latent_dim * 2)
 
@@ -155,12 +155,12 @@ class ACTHybridImagePolicy(BaseImagePolicy):
         mem_enc_layer = nn.TransformerEncoderLayer(
             d_model=n_emb, nhead=n_head,
             dim_feedforward=4*n_emb, dropout=p_drop,
-            activation='gelu', batch_first=True, norm_first=True)
+            activation='gelu', batch_first=True, norm_first=False)
         self.mem_encoder = nn.TransformerEncoder(mem_enc_layer, num_layers=n_mem_enc_layers)
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=n_emb, nhead=n_head,
             dim_feedforward=4*n_emb, dropout=p_drop,
-            activation='gelu', batch_first=True, norm_first=True)
+            activation='gelu', batch_first=True, norm_first=False)
         self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=n_layer)
         self.action_head = nn.Linear(n_emb, action_dim)
 
