@@ -138,10 +138,23 @@ class DETGRAMHybridImagePolicy(BaseImagePolicy):
                 )
             )
 
-        obs_feature_dim = obs_encoder.output_shape()[0]
+        # Compute spatial token count from backbone output shape
+        with torch.no_grad():
+            _backbone = obs_encoder.obs_nets[obs_config['rgb'][0]].nets[0]
+            _h, _w = (crop_shape[0], crop_shape[1]) if crop_shape is not None else obs_key_shapes[obs_config['rgb'][0]][1:]
+            _feat = _backbone(torch.zeros(1, 3, _h, _w))
+            backbone_dim = _feat.shape[1]
+            n_spatial = _feat.shape[2] * _feat.shape[3]
 
-        # ========= Obs projection =========
-        self.obs_proj = nn.Linear(obs_feature_dim, hidden_dim, bias=False)
+        n_tokens_per_step = len(obs_config['rgb']) * n_spatial + len(obs_config['low_dim'])
+        n_obs_tokens = n_obs_steps * n_tokens_per_step
+
+        # ========= Obs projections (spatial + low-dim) =========
+        self.spatial_proj = nn.Linear(backbone_dim, hidden_dim, bias=False)
+        self.lowdim_projs = nn.ModuleDict({
+            key: nn.Linear(obs_key_shapes[key][0], hidden_dim, bias=False)
+            for key in obs_config['low_dim']
+        })
 
         # ========= GRAM recursive decoder block (SHARED — single instance) =========
         self.block = GRAMBlock(
@@ -162,8 +175,8 @@ class DETGRAMHybridImagePolicy(BaseImagePolicy):
         self.register_buffer('z_init', z_init)
 
         # ========= Learned positional embedding + encoder for cross-attention memory =========
-        # memory layout: [z_token (1), obs_tokens (n_obs_steps)]
-        mem_len = 1 + n_obs_steps
+        # memory layout: [z_token (1), obs_tokens (n_obs_tokens)]
+        mem_len = 1 + n_obs_tokens
         self.mem_pos_embed = nn.Parameter(torch.zeros(1, mem_len, hidden_dim))
         nn.init.normal_(self.mem_pos_embed, std=0.02)
         mem_enc_layer = nn.TransformerEncoderLayer(
@@ -199,11 +212,13 @@ class DETGRAMHybridImagePolicy(BaseImagePolicy):
         self.obs_encoder = obs_encoder
         self.normalizer = LinearNormalizer()
         self.horizon = horizon
-        self.obs_feature_dim = obs_feature_dim
         self.action_dim = action_dim
         self.hidden_dim = hidden_dim
         self.n_action_steps = n_action_steps
         self.n_obs_steps = n_obs_steps
+        self.n_obs_tokens = n_obs_tokens
+        self.rgb_keys = obs_config['rgb']
+        self.lowdim_keys = obs_config['low_dim']
         self.n_recursion = n_recursion
         self.k_recursion = k_recursion
         self.N_sup = N_sup
@@ -218,12 +233,30 @@ class DETGRAMHybridImagePolicy(BaseImagePolicy):
 
     # ========= helpers =========
 
-    def encode_obs(self, nobs, B, To):
-        """Encode observations through robomimic obs encoder → (B, To, obs_feature_dim)."""
-        this_nobs = dict_apply(nobs,
-            lambda x: x[:, :To, ...].reshape(-1, *x.shape[2:]))
-        nobs_features = self.obs_encoder(this_nobs)
-        return nobs_features.reshape(B, To, -1)
+    def encode_obs_tokens(self, nobs, B, To):
+        """Encode observations to spatial tokens: (B, n_obs_tokens, hidden_dim).
+
+        For each rgb key: crop → backbone → spatial_proj → (B*To, h*w, D)
+        For each low_dim key: lowdim_proj → (B*To, 1, D)
+        Returns flattened across time: (B, To*n_tokens_per_step, D)
+        """
+        all_tokens = []
+        for key in self.rgb_keys:
+            imgs = nobs[key][:, :To].reshape(B * To, *nobs[key].shape[2:])
+            crop_rand = self.obs_encoder.obs_randomizers[key][0]
+            imgs = crop_rand.forward_in(imgs)
+            backbone = self.obs_encoder.obs_nets[key].nets[0]
+            feat = backbone(imgs)                                      # (B*To, C, h, w)
+            BTo, C, h, w = feat.shape
+            feat = feat.permute(0, 2, 3, 1).reshape(BTo, h * w, C)   # (B*To, h*w, C)
+            feat = self.spatial_proj(feat)                             # (B*To, h*w, D)
+            all_tokens.append(feat)
+        for key in self.lowdim_keys:
+            ld = nobs[key][:, :To].reshape(B * To, -1)
+            tok = self.lowdim_projs[key](ld).unsqueeze(1)             # (B*To, 1, D)
+            all_tokens.append(tok)
+        tokens = torch.cat(all_tokens, dim=1)                         # (B*To, n_per_step, D)
+        return tokens.reshape(B, To * tokens.shape[1], tokens.shape[2])
 
     def init_latents(self, B):
         """Return fixed initial GRAM latents expanded to batch size B."""
@@ -252,10 +285,10 @@ class DETGRAMHybridImagePolicy(BaseImagePolicy):
     def build_memory(self, obs_tokens, z):
         """Prepend z_token to obs_tokens, add positional embeddings, then encode.
 
-        memory = mem_encoder([z_token, obs_1, ..., obs_To] + pos_embed)
-        shape: (B, 1+To, D)
+        memory = mem_encoder([z_token, obs_tokens] + pos_embed)
+        shape: (B, 1+n_obs_tokens, D)
         """
-        z_token = self.latent_out_proj(z).unsqueeze(1)  # (B, 1, D)
+        z_token = self.latent_out_proj(z).unsqueeze(1)               # (B, 1, D)
         memory = torch.cat([z_token, obs_tokens], dim=1) + self.mem_pos_embed
         return self.mem_encoder(memory)
 
@@ -291,8 +324,7 @@ class DETGRAMHybridImagePolicy(BaseImagePolicy):
         B = next(iter(nobs.values())).shape[0]
         To = self.n_obs_steps
 
-        obs_features = self.encode_obs(nobs, B, To)
-        obs_tokens = self.obs_proj(obs_features)
+        obs_tokens = self.encode_obs_tokens(nobs, B, To)
 
         # Prior: z = 0 (mean of N(0,I))
         z_prior = torch.zeros(B, self.latent_dim, device=self.device, dtype=obs_tokens.dtype)
@@ -360,8 +392,7 @@ class DETGRAMHybridImagePolicy(BaseImagePolicy):
         B = nactions.shape[0]
         To = self.n_obs_steps
 
-        obs_features = self.encode_obs(nobs, B, To)
-        obs_tokens = self.obs_proj(obs_features)
+        obs_tokens = self.encode_obs_tokens(nobs, B, To)
 
         # CVAE: encode actions → z, build memory with z_token prepended
         mu, logvar, z_latent = self.encode_to_latent(nactions)
