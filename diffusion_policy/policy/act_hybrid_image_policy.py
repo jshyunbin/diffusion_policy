@@ -27,6 +27,7 @@ class ACTHybridImagePolicy(BaseImagePolicy):
             eval_fixed_crop=False,
             # arch
             n_layer=4,
+            n_mem_enc_layers=4,
             n_head=8,
             n_emb=256,
             p_drop=0.1,
@@ -155,7 +156,7 @@ class ACTHybridImagePolicy(BaseImagePolicy):
             d_model=n_emb, nhead=n_head,
             dim_feedforward=4*n_emb, dropout=p_drop,
             activation='gelu', batch_first=True, norm_first=True)
-        self.mem_encoder = nn.TransformerEncoder(mem_enc_layer, num_layers=n_layer)
+        self.mem_encoder = nn.TransformerEncoder(mem_enc_layer, num_layers=n_mem_enc_layers)
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=n_emb, nhead=n_head,
             dim_feedforward=4*n_emb, dropout=p_drop,

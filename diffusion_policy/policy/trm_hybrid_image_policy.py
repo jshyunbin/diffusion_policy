@@ -56,6 +56,7 @@ class TRMHybridImagePolicy(BaseImagePolicy):
             latent_dim=32,
             kl_weight=10.0,
             n_encoder_layers=2,
+            n_mem_enc_layers=4,
             encoder_dropout=0.1,
             # inference
             inference_n_sup=16,
@@ -186,7 +187,7 @@ class TRMHybridImagePolicy(BaseImagePolicy):
             d_model=hidden_dim, nhead=n_heads,
             dim_feedforward=4 * hidden_dim, dropout=encoder_dropout,
             activation='relu', batch_first=True, norm_first=False)
-        self.context_encoder = nn.TransformerEncoder(context_enc_layer, num_layers=n_encoder_layers)
+        self.context_encoder = nn.TransformerEncoder(context_enc_layer, num_layers=n_mem_enc_layers)
 
         # ========= CVAE encoder (same as DET-GRAM, actions only) =========
         self.cls_embed = nn.Parameter(torch.zeros(1, 1, hidden_dim))

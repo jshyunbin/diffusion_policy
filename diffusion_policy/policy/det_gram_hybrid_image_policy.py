@@ -60,6 +60,7 @@ class DETGRAMHybridImagePolicy(BaseImagePolicy):
             latent_dim=32,
             kl_weight=10.0,
             n_encoder_layers=2,
+            n_mem_enc_layers=4,
             encoder_dropout=0.1,
             # inference
             inference_n_sup=8,
@@ -183,7 +184,7 @@ class DETGRAMHybridImagePolicy(BaseImagePolicy):
             d_model=hidden_dim, nhead=n_heads,
             dim_feedforward=4 * hidden_dim, dropout=encoder_dropout,
             activation='relu', batch_first=True, norm_first=False)
-        self.mem_encoder = nn.TransformerEncoder(mem_enc_layer, num_layers=n_encoder_layers)
+        self.mem_encoder = nn.TransformerEncoder(mem_enc_layer, num_layers=n_mem_enc_layers)
 
         # ========= CVAE encoder (ACT-style, actions only) =========
         # Encodes ground truth action sequence into latent z.

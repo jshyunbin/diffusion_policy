@@ -32,6 +32,7 @@ policy:
   eval_fixed_crop: True
 
   n_layer: 4
+  n_mem_enc_layers: 4
   n_head: 8
   n_emb: 256
   p_drop: 0.1
