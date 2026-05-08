@@ -138,6 +138,7 @@ class HRAMHybridImagePolicy(BaseImagePolicy):
         n_tokens_per_step = len(obs_config['rgb']) * n_spatial + len(obs_config['low_dim'])
         n_obs_tokens = n_obs_steps * n_tokens_per_step
 
+
         # ========= Obs projections (spatial + low-dim) =========
         self.spatial_proj = nn.Linear(backbone_dim, hidden_dim, bias=False)
         self.lowdim_projs = nn.ModuleDict({
@@ -153,10 +154,12 @@ class HRAMHybridImagePolicy(BaseImagePolicy):
         head_dim = hidden_dim // n_heads
         freqs_cis = precompute_freqs_cis(head_dim, max_seq_len=horizon)
         self.register_buffer('freqs_cis', freqs_cis)
+        obs_freqs_cis = precompute_freqs_cis(head_dim, max_seq_len=n_obs_tokens+1)
+        self.register_buffer('obs_freqs_cis', obs_freqs_cis)
 
         # ========= Fixed initial latent states =========
         y_init = torch.empty(1, horizon, hidden_dim)
-        z_init = torch.empty(1, horizon, hidden_dim)
+        z_init = torch.empty(1, n_obs_tokens + 1, hidden_dim)
         nn.init.trunc_normal_(y_init, std=1.0, a=-2.0, b=2.0)
         nn.init.trunc_normal_(z_init, std=1.0, a=-2.0, b=2.0)
         self.register_buffer('y_init', y_init)
@@ -268,7 +271,7 @@ class HRAMHybridImagePolicy(BaseImagePolicy):
         def _step(y, z_L):
             # K low-latent updates
             for _ in range(K):
-                z_L = self.context_encoder((z_L + x) if self.use_z_L else z_L, memory=y, freqs_cis=self.freqs_cis,
+                z_L = self.context_encoder((z_L + x) if self.use_z_L else z_L, memory=y, freqs_cis=self.obs_freqs_cis,
                                     cross_attn_mask=None)
             # 1 high-latent update
             y = self.block(y, memory=z_L, freqs_cis=self.freqs_cis,
@@ -370,7 +373,7 @@ class HRAMHybridImagePolicy(BaseImagePolicy):
         total_mse = 0.0
 
         for sup_step in range(self.N_sup):
-            y, z_gram = self.latent_recursion(
+            y, z_L = self.latent_recursion(
                 obs_tokens, z_cvae_token, y, z_L, self.n_recursion, self.k_recursion)
 
             action_pred = self.output_head(y)
@@ -388,7 +391,7 @@ class HRAMHybridImagePolicy(BaseImagePolicy):
             total_mse += mse.item()
 
             y = y.detach()
-            z_gram = z_gram.detach()
+            z_L = z_L.detach()
 
         return {
             'loss': total_loss,
