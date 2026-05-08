@@ -33,6 +33,7 @@ policy:
 
   # GRAM decoder architecture
   hidden_dim: 256
+  n_mem_enc_layers: 4
   n_decoder_layers: 2
   n_heads: 8
   ffn_expansion: 4
@@ -47,7 +48,6 @@ policy:
   latent_dim: 32
   kl_weight: 10.0
   n_encoder_layers: 2
-  n_mem_enc_layers: 4
   encoder_dropout: 0.1
 
   # Inference
