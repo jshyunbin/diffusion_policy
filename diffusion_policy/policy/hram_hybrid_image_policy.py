@@ -211,7 +211,7 @@ class HRAMHybridImagePolicy(BaseImagePolicy):
 
         n_params = sum(p.numel() for p in self.parameters())
         n_block = sum(p.numel() for p in self.block.parameters())
-        print(f"TRMHybridImagePolicy: {n_params:,} total params, "
+        print(f"HRAMHybridImagePolicy: {n_params:,} total params, "
               f"{n_block:,} block params")
 
     # ========= helpers =========
