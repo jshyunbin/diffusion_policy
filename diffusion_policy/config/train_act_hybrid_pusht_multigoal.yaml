@@ -31,7 +31,7 @@ policy:
   obs_encoder_group_norm: True
   eval_fixed_crop: True
 
-  n_layer: 4
+  n_layer: 7
   n_mem_enc_layers: 4
   n_head: 8
   n_emb: 256
@@ -77,7 +77,7 @@ training:
   # optimization
   lr_scheduler: cosine
   lr_warmup_steps: 1000
-  num_epochs: 3050
+  num_epochs: 2000
   gradient_accumulate_every: 1
   use_ema: True
   # training loop control

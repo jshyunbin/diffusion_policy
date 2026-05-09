@@ -38,7 +38,7 @@ import robomimic.utils.obs_utils as ObsUtils
 import robomimic.models.obs_core as rmoc
 import diffusion_policy.model.vision.crop_randomizer as dmvc
 from diffusion_policy.common.pytorch_util import dict_apply, replace_submodules
-from diffusion_policy.model.gram.gram_modules import GRAMBlock, precompute_freqs_cis
+from diffusion_policy.model.gram.gram_modules import RActionBlock, precompute_freqs_cis
 
 
 class GRAMHybridImagePolicy(BaseImagePolicy):
@@ -153,7 +153,7 @@ class GRAMHybridImagePolicy(BaseImagePolicy):
         self.obs_proj = nn.Linear(obs_feature_dim, hidden_dim, bias=False)
 
         # ========= GRAM recursive decoder block (SHARED — single instance) =========
-        self.block = GRAMBlock(
+        self.block = RActionBlock(
             dim=hidden_dim, n_heads=n_heads,
             n_layers=n_decoder_layers, ffn_expansion=ffn_expansion)
 

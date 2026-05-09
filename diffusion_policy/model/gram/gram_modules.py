@@ -150,8 +150,8 @@ class GRAMTransformerLayer(nn.Module):
         return x
 
 
-class GRAMBlock(nn.Module):
-    """GRAM recursive transformer block: n_layers shared layers.
+class RActionBlock(nn.Module):
+    """Recursive action transformer block: n_layers shared layers.
     This single block is applied repeatedly during recursion.
     """
 
