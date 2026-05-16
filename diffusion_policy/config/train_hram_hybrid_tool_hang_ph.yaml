@@ -1,8 +1,8 @@
 defaults:
   - _self_
-  - task: pusht_image_multigoal
+  - task: tool_hang_image
 
-name: train_hram_hybrid
+name: train_hram_hybrid_tool_hang_ph
 _target_: diffusion_policy.workspace.train_hram_hybrid_workspace.TrainHRAMHybridWorkspace
 
 task_name: ${task.name}
@@ -27,30 +27,27 @@ policy:
   n_action_steps: ${eval:'${n_action_steps}+${n_latency_steps}'}
   n_obs_steps: ${n_obs_steps}
 
-  crop_shape: [76, 76]
+  # 216x216 crop from 240x240 mirrors the 76/84 ratio used for square
+  crop_shape: [216, 216]
   obs_encoder_group_norm: True
   eval_fixed_crop: True
 
-  # GRAM decoder architecture
   hidden_dim: 256
   n_mem_enc_layers: 2
   n_decoder_layers: 4
   n_heads: 8
   ffn_expansion: 4
 
-  # Recursion
-  n_recursion: 3    # outer steps (n-1 warm-up + 1 final with gradients)
-  k_recursion: 4    # z-updates per outer step (inner loop)
+  n_recursion: 3
+  k_recursion: 4
   N_sup: 8
   use_z_L: True
 
-  # CVAE encoder (ACT-style latent initialization)
   latent_dim: 32
   kl_weight: 10.0
   n_encoder_layers: 4
   encoder_dropout: 0.1
 
-  # Inference
   inference_n_sup: 8
 
 ema:
@@ -62,14 +59,14 @@ ema:
   max_value: 0.9999
 
 dataloader:
-  batch_size: 512
+  batch_size: 256
   num_workers: 0
   shuffle: True
   pin_memory: True
   persistent_workers: False
 
 val_dataloader:
-  batch_size: 512
+  batch_size: 256
   num_workers: 0
   shuffle: False
   pin_memory: True
@@ -86,23 +83,18 @@ training:
   seed: 42
   debug: False
   resume: True
-  # optimization
   lr_scheduler: cosine
   lr_warmup_steps: 500
-  num_epochs: 1000
+  num_epochs: 1500
   gradient_accumulate_every: 1
   use_ema: True
   grad_clip: 1.0
-  # training loop control
-  # in epochs
-  rollout_every: 10
-  checkpoint_every: 10
+  rollout_every: 50
+  checkpoint_every: 50
   val_every: 1
   sample_every: 5
-  # steps per epoch
   max_train_steps: null
   max_val_steps: null
-  # misc
   tqdm_interval_sec: 1.0
 
 logging:

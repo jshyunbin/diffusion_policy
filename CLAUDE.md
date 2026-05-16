@@ -34,7 +34,7 @@ Terminology: `To` = n_obs_steps (observation horizon), `Ta` = n_action_steps (ac
 
 ## Environment
 
-- Python 3.12, venv at `/media/sunho/data/hyunbin/deep-reasoning-policy/old-repo/.venv`
+- Python 3.12, venv at `/media/sunho/data/hyunbin/deep-reasoning-policy/diffusion_policy/.venv`
 - Environments use gymnasium (not gym)
 - GPU: RTX 3090, memory-bandwidth bottlenecked (~384 samples/sec regardless of batch size)
 - wandb project: `recursive-reasoning-robot-policy`, entity: `jhyunbin`
