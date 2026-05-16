@@ -101,7 +101,14 @@ class TrainHRAMHybridWorkspace(BaseWorkspace):
             config=OmegaConf.to_container(cfg, resolve=True),
             **cfg.logging
         )
-        wandb.config.update({"output_dir": self.output_dir})
+        n_params = sum(p.numel() for p in self.model.parameters())
+        param_size_mb = sum(p.numel() * p.element_size() for p in self.model.parameters()) / 1024**2
+        print(f"Model: {n_params:,} parameters ({param_size_mb:.1f} MB)")
+        wandb.config.update({
+            "output_dir": self.output_dir,
+            "n_params": n_params,
+            "param_size_mb": param_size_mb,
+        })
 
         topk_manager = TopKCheckpointManager(
             save_dir=os.path.join(self.output_dir, 'checkpoints'),
