@@ -62,12 +62,18 @@ class RobomimicImageWrapper(gym.Env):
     def get_observation(self, raw_obs=None):
         if raw_obs is None:
             raw_obs = self.env.get_observation()
-        
-        self.render_cache = raw_obs[self.render_obs_key]
 
         obs = dict()
         for key in self.observation_space.keys():
-            obs[key] = raw_obs[key]
+            obs_val = raw_obs[key]
+            if key.endswith('image'):
+                # robomimic returns HWC uint8; policy expects CHW float32
+                obs_val = np.moveaxis(obs_val.astype(np.float32) / 255.0, -1, 0)
+            else:
+                obs_val = obs_val.astype(np.float32)
+            obs[key] = obs_val
+
+        self.render_cache = obs[self.render_obs_key]  # CHW float32 for render()
         return obs
 
     def seed(self, seed=None):
