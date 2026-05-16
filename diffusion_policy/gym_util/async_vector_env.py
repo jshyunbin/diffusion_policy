@@ -118,7 +118,7 @@ class AsyncVectorEnv(VectorEnv):
                     self.observation_space, n=self.num_envs, ctx=ctx
                 )
                 self.observations = read_from_shared_memory(
-                    _obs_buffer, self.observation_space, n=self.num_envs
+                    self.observation_space, _obs_buffer, n=self.num_envs
                 )
             except CustomSpaceError:
                 raise ValueError(
@@ -527,13 +527,13 @@ def _worker_shared_memory(index, env_fn, pipe, parent_pipe, shared_memory, error
             if command == "reset":
                 observation, info = env.reset(**data)
                 write_to_shared_memory(
-                    index, observation, shared_memory, observation_space
+                    observation_space, index, observation, shared_memory
                 )
                 pipe.send(((None, info), True))
             elif command == "step":
                 observation, reward, terminated, truncated, info = env.step(data)
                 write_to_shared_memory(
-                    index, observation, shared_memory, observation_space
+                    observation_space, index, observation, shared_memory
                 )
                 pipe.send(((None, reward, terminated, truncated, info), True))
             elif command == "seed":
