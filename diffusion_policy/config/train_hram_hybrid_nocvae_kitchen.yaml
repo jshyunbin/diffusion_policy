@@ -33,7 +33,7 @@ policy:
 
   n_recursion: 3
   k_recursion: 4
-  N_sup: 8
+  N_sup: 16
   use_z_L: True
   use_cvae: False
 
@@ -42,7 +42,7 @@ policy:
   n_encoder_layers: 4
   encoder_dropout: 0.1
 
-  inference_n_sup: 8
+  inference_n_sup: 16
 
 ema:
   _target_: diffusion_policy.model.diffusion.ema_model.EMAModel
