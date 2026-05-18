@@ -41,6 +41,7 @@ policy:
   k_recursion: 4
   N_sup: 8
   use_z_L: True
+  use_cvae: True
 
   latent_dim: 32
   kl_weight: 10.0

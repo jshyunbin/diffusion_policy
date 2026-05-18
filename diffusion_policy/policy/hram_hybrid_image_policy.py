@@ -45,6 +45,7 @@ class HRAMHybridImagePolicy(BaseImagePolicy):
             N_sup=16,
             use_z_L=True,
             # CVAE encoder
+            use_cvae=True,
             latent_dim=32,
             kl_weight=10.0,
             n_encoder_layers=2,
@@ -154,12 +155,13 @@ class HRAMHybridImagePolicy(BaseImagePolicy):
         head_dim = hidden_dim // n_heads
         freqs_cis = precompute_freqs_cis(head_dim, max_seq_len=horizon)
         self.register_buffer('freqs_cis', freqs_cis)
-        obs_freqs_cis = precompute_freqs_cis(head_dim, max_seq_len=n_obs_tokens+1)
+        n_z_tokens = n_obs_tokens + (1 if use_cvae else 0)
+        obs_freqs_cis = precompute_freqs_cis(head_dim, max_seq_len=n_z_tokens)
         self.register_buffer('obs_freqs_cis', obs_freqs_cis)
 
         # ========= Fixed initial latent states =========
         y_init = torch.empty(1, horizon, hidden_dim)
-        z_init = torch.empty(1, n_obs_tokens + 1, hidden_dim)
+        z_init = torch.empty(1, n_z_tokens, hidden_dim)
         nn.init.trunc_normal_(y_init, std=1.0, a=-2.0, b=2.0)
         nn.init.trunc_normal_(z_init, std=1.0, a=-2.0, b=2.0)
         self.register_buffer('y_init', y_init)
@@ -172,21 +174,23 @@ class HRAMHybridImagePolicy(BaseImagePolicy):
             n_layers=n_mem_enc_layers, ffn_expansion=ffn_expansion
         )
         self.use_z_L = use_z_L
+        self.use_cvae = use_cvae
 
         # ========= CVAE encoder (same as DET-GRAM, actions only) =========
-        self.cls_embed = nn.Parameter(torch.zeros(1, 1, hidden_dim))
-        nn.init.normal_(self.cls_embed, std=0.02)
-        self.encoder_action_proj = nn.Linear(action_dim, hidden_dim)
-        self.encoder_pos_embed = nn.Parameter(
-            torch.zeros(1, 1 + horizon, hidden_dim))
-        nn.init.normal_(self.encoder_pos_embed, std=0.02)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=hidden_dim, nhead=n_heads,
-            dim_feedforward=4 * hidden_dim, dropout=encoder_dropout,
-            activation='relu', batch_first=True, norm_first=False)
-        self.cvae_encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_encoder_layers)
-        self.latent_proj = nn.Linear(hidden_dim, latent_dim * 2)
-        self.latent_out_proj = nn.Linear(latent_dim, hidden_dim)
+        if use_cvae:
+            self.cls_embed = nn.Parameter(torch.zeros(1, 1, hidden_dim))
+            nn.init.normal_(self.cls_embed, std=0.02)
+            self.encoder_action_proj = nn.Linear(action_dim, hidden_dim)
+            self.encoder_pos_embed = nn.Parameter(
+                torch.zeros(1, 1 + horizon, hidden_dim))
+            nn.init.normal_(self.encoder_pos_embed, std=0.02)
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=hidden_dim, nhead=n_heads,
+                dim_feedforward=4 * hidden_dim, dropout=encoder_dropout,
+                activation='relu', batch_first=True, norm_first=False)
+            self.cvae_encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_encoder_layers)
+            self.latent_proj = nn.Linear(hidden_dim, latent_dim * 2)
+            self.latent_out_proj = nn.Linear(latent_dim, hidden_dim)
 
         # ========= Output head =========
         self.output_head = nn.Linear(hidden_dim, action_dim, bias=False)
@@ -205,7 +209,7 @@ class HRAMHybridImagePolicy(BaseImagePolicy):
         self.n_recursion = n_recursion
         self.k_recursion = k_recursion
         self.N_sup = N_sup
-        self.latent_dim = latent_dim
+        self.latent_dim = latent_dim if use_cvae else None
         self.kl_weight = kl_weight
         self.inference_n_sup = inference_n_sup
 
@@ -266,7 +270,7 @@ class HRAMHybridImagePolicy(BaseImagePolicy):
         Truncated warm-up: first n-1 outer steps under no_grad.
         """
         # Encode context once — fixed for all steps within this call
-        x = torch.cat([z_cvae_token, obs_tokens], dim=1)
+        x = torch.cat([z_cvae_token, obs_tokens], dim=1) if self.use_cvae else obs_tokens
 
         def _step(y, z_L):
             # K low-latent updates
@@ -294,14 +298,15 @@ class HRAMHybridImagePolicy(BaseImagePolicy):
 
         obs_tokens = self.encode_obs_tokens(nobs, B, To)
 
-        # Prior: z = 0
-        z_prior = torch.zeros(B, self.latent_dim, device=self.device, dtype=obs_tokens.dtype)
-        z_cvae_token = self.latent_out_proj(z_prior).unsqueeze(1)  # (B, 1, D)
+        if self.use_cvae:
+            z_prior = torch.zeros(B, self.latent_dim, device=self.device, dtype=obs_tokens.dtype)
+            z_cvae_token = self.latent_out_proj(z_prior).unsqueeze(1)  # (B, 1, D)
+        else:
+            z_cvae_token = None
 
         y, z_L = self.init_latents(B)
         if not self.use_z_L:
-            # initialize z_L to x since there is not independent low latent. 
-            z_L = torch.cat([z_cvae_token, obs_tokens], dim=1)
+            z_L = torch.cat([z_cvae_token, obs_tokens], dim=1) if self.use_cvae else obs_tokens
         for _ in range(self.inference_n_sup):
             y, z_L = self.latent_recursion(
                 obs_tokens, z_cvae_token, y, z_L, self.n_recursion, self.k_recursion)
@@ -359,16 +364,18 @@ class HRAMHybridImagePolicy(BaseImagePolicy):
 
         obs_tokens = self.encode_obs_tokens(nobs, B, To)
 
-        mu, logvar, z_latent = self.encode_to_latent(nactions)
-        z_cvae_token = self.latent_out_proj(z_latent).unsqueeze(1)  # (B, 1, D)
-
-        kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+        if self.use_cvae:
+            mu, logvar, z_latent = self.encode_to_latent(nactions)
+            z_cvae_token = self.latent_out_proj(z_latent).unsqueeze(1)  # (B, 1, D)
+            kl_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
+        else:
+            z_cvae_token = None
+            kl_loss = None
 
         y, z_L = self.init_latents(B)
         if not self.use_z_L:
-            # initialize z_L to x since there is not independent low latent. 
-            z_L = torch.cat([z_cvae_token, obs_tokens], dim=1)
-            
+            z_L = torch.cat([z_cvae_token, obs_tokens], dim=1) if self.use_cvae else obs_tokens
+
         total_loss = 0.0
         total_mse = 0.0
 
@@ -380,7 +387,7 @@ class HRAMHybridImagePolicy(BaseImagePolicy):
             mse = F.mse_loss(action_pred, nactions)
             step_loss = mse / self.N_sup
 
-            if sup_step == 0:
+            if sup_step == 0 and self.use_cvae:
                 step_loss = step_loss + self.kl_weight * kl_loss / self.N_sup
 
             if torch.is_grad_enabled():
@@ -393,8 +400,10 @@ class HRAMHybridImagePolicy(BaseImagePolicy):
             y = y.detach()
             z_L = z_L.detach()
 
-        return {
+        ret = {
             'loss': total_loss,
             'mse_loss': total_mse / self.N_sup,
-            'kl_loss': kl_loss.item(),
         }
+        if self.use_cvae:
+            ret['kl_loss'] = kl_loss.item()
+        return ret
