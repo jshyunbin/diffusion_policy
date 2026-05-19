@@ -8,8 +8,8 @@ import dill
 import math
 import logging
 import wandb.sdk.data_types.video as wv
-import gym
-import gym.spaces
+import gymnasium as gym
+import gymnasium.spaces
 import multiprocessing as mp
 from diffusion_policy.gym_util.async_vector_env import AsyncVectorEnv
 from diffusion_policy.gym_util.sync_vector_env import SyncVectorEnv
@@ -160,9 +160,9 @@ class KitchenLowdimRunner(BaseLowdimRunner):
             # Create a fake env whose sole purpos is to provide 
             # obs/action spaces and metadata.
             env = gym.Env()
-            env.observation_space = gym.spaces.Box(
+            env.observation_space = gymnasium.spaces.Box(
                 -8, 8, shape=(60,), dtype=np.float32)
-            env.action_space = gym.spaces.Box(
+            env.action_space = gymnasium.spaces.Box(
                 -8, 8, shape=(9,), dtype=np.float32)
             env.metadata = {
                 'render.modes': ['human', 'rgb_array', 'depth_array'],
@@ -226,7 +226,7 @@ class KitchenLowdimRunner(BaseLowdimRunner):
                 args_list=[(x,) for x in this_init_fns])
 
             # start rollout
-            obs = env.reset()
+            obs, _ = env.reset()
             past_action = None
             policy.reset()
 
@@ -258,8 +258,8 @@ class KitchenLowdimRunner(BaseLowdimRunner):
                 action = np_action_dict['action']
 
                 # step env
-                obs, reward, done, info = env.step(action)
-                done = np.all(done)
+                obs, reward, terminated, truncated, info = env.step(action)
+                done = np.all(terminated) or np.all(truncated)
                 past_action = action
 
                 # update pbar

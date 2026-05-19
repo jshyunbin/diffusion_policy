@@ -206,8 +206,8 @@ class TrainHRAMHybridLowdimWorkspace(BaseWorkspace):
                             for batch_idx, batch in enumerate(tepoch):
                                 batch = dict_apply(batch, lambda x: x.to(device, non_blocking=True))
                                 loss_output = self.model.compute_loss(batch)
-                                loss_val = loss_output['loss'] if isinstance(loss_output, dict) else (
-                                    loss_output if isinstance(loss_output, float) else loss_output.item())
+                                raw_val = loss_output['loss'] if isinstance(loss_output, dict) else loss_output
+                                loss_val = raw_val.item() if isinstance(raw_val, torch.Tensor) else float(raw_val)
                                 val_losses.append(loss_val)
                                 if (cfg.training.max_val_steps is not None) \
                                     and batch_idx >= (cfg.training.max_val_steps-1):
@@ -219,7 +219,7 @@ class TrainHRAMHybridLowdimWorkspace(BaseWorkspace):
                 if (self.epoch % cfg.training.sample_every) == 0:
                     with torch.no_grad():
                         batch = dict_apply(train_sampling_batch, lambda x: x.to(device, non_blocking=True))
-                        obs_dict = batch['obs']
+                        obs_dict = {'obs': batch['obs']}
                         gt_action = batch['action']
                         result = policy.predict_action(obs_dict)
                         pred_action = result['action_pred']

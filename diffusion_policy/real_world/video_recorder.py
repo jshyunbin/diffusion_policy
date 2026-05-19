@@ -1,4 +1,5 @@
 from typing import Optional, Callable, Generator
+from fractions import Fraction
 import numpy as np
 import av
 from diffusion_policy.common.timestamp_accumulator import get_accumulate_timestamp_idxs
@@ -108,7 +109,7 @@ class VideoRecorder:
             self.stop()
 
         self.container = av.open(file_path, mode='w')
-        self.stream = self.container.add_stream(self.codec, rate=self.fps)
+        self.stream = self.container.add_stream(self.codec, rate=Fraction(self.fps).limit_denominator(1000))
         codec_context = self.stream.codec_context
         for k, v in self.kwargs.items():
             setattr(codec_context, k, v)

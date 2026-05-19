@@ -12,7 +12,7 @@ env_runner:
   n_train: 6
   n_train_vis: 2
   train_start_seed: 0
-  n_test: 50
+  n_test: 22
   n_test_vis: 4
   test_start_seed: 100000
   max_steps: 280
@@ -21,7 +21,7 @@ env_runner:
   render_hw: [240, 360]
   fps: 12.5
   past_action: ${past_action_visible}
-  n_envs: null
+  n_envs: 10
 
 dataset:
   _target_: diffusion_policy.dataset.kitchen_lowdim_dataset.KitchenLowdimDataset

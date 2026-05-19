@@ -102,8 +102,8 @@ class ACTHybridLowdimPolicy(BaseLowdimPolicy):
         decoder_output = self.decoder(queries, memory)
         return self.action_head(decoder_output)
 
-    def predict_action(self, obs_dict: torch.Tensor) -> Dict[str, torch.Tensor]:
-        nobs = self.normalizer['obs'].normalize(obs_dict)
+    def predict_action(self, obs_dict: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        nobs = self.normalizer['obs'].normalize(obs_dict['obs'])
         B = nobs.shape[0]
         To = self.n_obs_steps
         obs_tokens = self.encode_obs_tokens(nobs, B, To)

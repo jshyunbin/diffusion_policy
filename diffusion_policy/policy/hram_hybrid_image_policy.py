@@ -384,8 +384,8 @@ class HRAMHybridImagePolicy(BaseImagePolicy):
                 obs_tokens, z_cvae_token, y, z_L, self.n_recursion, self.k_recursion)
 
             action_pred = self.output_head(y)
-            mse = F.mse_loss(action_pred, nactions)
-            step_loss = mse / self.N_sup
+            l1 = F.l1_loss(action_pred, nactions)
+            step_loss = l1 / self.N_sup
 
             if sup_step == 0 and self.use_cvae:
                 step_loss = step_loss + self.kl_weight * kl_loss / self.N_sup
@@ -395,14 +395,14 @@ class HRAMHybridImagePolicy(BaseImagePolicy):
                 step_loss.backward(retain_graph=not is_last)
 
             total_loss += step_loss.item()
-            total_mse += mse.item()
+            total_mse += l1.item()
 
             y = y.detach()
             z_L = z_L.detach()
 
         ret = {
             'loss': total_loss,
-            'mse_loss': total_mse / self.N_sup,
+            'l1_loss': total_mse / self.N_sup,
         }
         if self.use_cvae:
             ret['kl_loss'] = kl_loss.item()
